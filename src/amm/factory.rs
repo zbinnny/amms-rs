@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ethers::{
     providers::{Middleware, StreamExt},
-    types::{BlockNumber, Filter, Log, ValueOrArray, H160, H256, U64},
+    types::{BlockNumber, Filter, H160, H256, Log, U64, ValueOrArray},
 };
 use futures::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
@@ -11,15 +11,21 @@ use serde::{Deserialize, Serialize};
 use crate::errors::{AMMError, EventLogError};
 
 use super::{
-    uniswap_v2::factory::{UniswapV2Factory, PAIR_CREATED_EVENT_SIGNATURE},
-    uniswap_v3::factory::{UniswapV3Factory, POOL_CREATED_EVENT_SIGNATURE},
     AMM,
+    uniswap_v2::factory::{PAIR_CREATED_EVENT_SIGNATURE, UniswapV2Factory},
+    uniswap_v3::factory::{POOL_CREATED_EVENT_SIGNATURE, UniswapV3Factory},
 };
 
 #[async_trait]
 pub trait AutomatedMarketMakerFactory {
     /// Returns the address of the factory.
     fn address(&self) -> H160;
+
+    /// Returns the block number at which the factory was created.
+    fn creation_block(&self) -> u64;
+
+    /// Returns the creation event signature for the factory.
+    fn amm_created_event_signature(&self) -> H256;
 
     /// Gets all Pools from the factory created logs up to the `to_block` block number.
     ///
@@ -31,6 +37,14 @@ pub trait AutomatedMarketMakerFactory {
         step: u64,
     ) -> Result<Vec<AMM>, AMMError<M>>;
 
+    /// Creates a new AMM from a log factory creation event.
+    ///
+    /// Returns a AMM with data populated.
+    async fn new_amm_from_log<M: 'static + Middleware>(&self, log: Log, middleware: Arc<M>) -> Result<AMM, AMMError<M>>;
+
+    /// Creates a new empty AMM from a log factory creation event.
+    fn new_empty_amm_from_log(&self, log: Log) -> Result<AMM, ethers::abi::Error>;
+
     /// Populates all AMMs data via batched static calls.
     async fn populate_amm_data<M: Middleware>(
         &self,
@@ -38,24 +52,6 @@ pub trait AutomatedMarketMakerFactory {
         block_number: Option<u64>,
         middleware: Arc<M>,
     ) -> Result<(), AMMError<M>>;
-
-    /// Returns the creation event signature for the factory.
-    fn amm_created_event_signature(&self) -> H256;
-
-    /// Returns the block number at which the factory was created.
-    fn creation_block(&self) -> u64;
-
-    /// Creates a new AMM from a log factory creation event.
-    ///
-    /// Returns a AMM with data populated.
-    async fn new_amm_from_log<M: 'static + Middleware>(
-        &self,
-        log: Log,
-        middleware: Arc<M>,
-    ) -> Result<AMM, AMMError<M>>;
-
-    /// Creates a new empty AMM from a log factory creation event.
-    fn new_empty_amm_from_log(&self, log: Log) -> Result<AMM, ethers::abi::Error>;
 }
 
 macro_rules! factory {
@@ -73,29 +69,9 @@ macro_rules! factory {
                 }
             }
 
-            async fn get_all_amms<M: 'static + Middleware>(
-                &self,
-                to_block: Option<u64>,
-                middleware: Arc<M>,
-                step: u64,
-            ) -> Result<Vec<AMM>, AMMError<M>> {
+            fn creation_block(&self) -> u64 {
                 match self {
-                    $(Factory::$factory_type(factory) => {
-                        factory.get_all_amms(to_block, middleware, step).await
-                    },)+
-                }
-            }
-
-            async fn populate_amm_data<M: Middleware>(
-                &self,
-                amms: &mut [AMM],
-                block_number: Option<u64>,
-                middleware: Arc<M>,
-            ) -> Result<(), AMMError<M>> {
-                match self {
-                    $(Factory::$factory_type(factory) => {
-                        factory.populate_amm_data(amms, block_number, middleware).await
-                    },)+
+                    $(Factory::$factory_type(factory) => factory.creation_block(),)+
                 }
             }
 
@@ -105,9 +81,16 @@ macro_rules! factory {
                 }
             }
 
-            fn creation_block(&self) -> u64 {
+            async fn get_all_amms<M: 'static + Middleware>(
+                &self,
+                to_block: Option<u64>,
+                middleware: Arc<M>,
+                step: u64,
+            ) -> Result<Vec<AMM>, AMMError<M>> {
                 match self {
-                    $(Factory::$factory_type(factory) => factory.creation_block(),)+
+                    $(Factory::$factory_type(factory) => {
+                        factory.get_all_amms(to_block, middleware, step).await
+                    })+
                 }
             }
 
@@ -124,6 +107,19 @@ macro_rules! factory {
             fn new_empty_amm_from_log(&self, log: Log) -> Result<AMM, ethers::abi::Error> {
                 match self {
                     $(Factory::$factory_type(factory) => factory.new_empty_amm_from_log(log),)+
+                }
+            }
+
+            async fn populate_amm_data<M: Middleware>(
+                &self,
+                amms: &mut [AMM],
+                block_number: Option<u64>,
+                middleware: Arc<M>,
+            ) -> Result<(), AMMError<M>> {
+                match self {
+                    $(Factory::$factory_type(factory) => {
+                        factory.populate_amm_data(amms, block_number, middleware).await
+                    })+
                 }
             }
         }

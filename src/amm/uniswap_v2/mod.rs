@@ -1,27 +1,26 @@
-pub mod batch_request;
-pub mod factory;
-
 use std::sync::Arc;
 
-use crate::{
-    amm::AutomatedMarketMaker,
-    errors::{AMMError, ArithmeticError, EventLogError, SwapSimulationError},
-};
 use async_trait::async_trait;
 use ethers::{
     abi::{ethabi::Bytes, RawLog, Token},
-    prelude::EthEvent,
+    prelude::{abigen, EthEvent},
     providers::Middleware,
-    types::{Log, H160, H256, U256},
+    types::{H160, H256, Log, U256},
 };
 use num_bigfloat::BigFloat;
 use ruint::Uint;
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
-use ethers::prelude::abigen;
+use crate::{
+    amm::AutomatedMarketMaker,
+    errors::{AMMError, ArithmeticError, EventLogError, SwapSimulationError},
+};
 
 use self::factory::PAIR_CREATED_EVENT_SIGNATURE;
+
+pub mod batch_request;
+pub mod factory;
 
 abigen!(
     IUniswapV2Pair,
@@ -55,6 +54,7 @@ pub struct UniswapV2Pool {
     pub token_b_decimals: u8,
     pub reserve_0: u128,
     pub reserve_1: u128,
+    pub last_synced: (u64, u64),
     pub fee: u32,
 }
 
@@ -62,6 +62,18 @@ pub struct UniswapV2Pool {
 impl AutomatedMarketMaker for UniswapV2Pool {
     fn address(&self) -> H160 {
         self.address
+    }
+
+    fn tokens(&self) -> Vec<H160> {
+        vec![self.token_a, self.token_b]
+    }
+
+    fn last_synced_log(&self) -> (u64, u64) {
+        self.last_synced
+    }
+
+    fn sync_on_event_signatures(&self) -> Vec<H256> {
+        vec![SYNC_EVENT_SIGNATURE]
     }
 
     #[instrument(skip(self, middleware), level = "debug")]
@@ -75,44 +87,52 @@ impl AutomatedMarketMaker for UniswapV2Pool {
         Ok(())
     }
 
-    #[instrument(skip(self, middleware), level = "debug")]
-    async fn populate_data<M: Middleware>(
-        &mut self,
-        _block_number: Option<u64>,
-        middleware: Arc<M>,
-    ) -> Result<(), AMMError<M>> {
-        batch_request::get_v2_pool_data_batch_request(self, middleware.clone()).await?;
-
-        Ok(())
-    }
-
-    fn sync_on_event_signatures(&self) -> Vec<H256> {
-        vec![SYNC_EVENT_SIGNATURE]
-    }
-
     #[instrument(skip(self), level = "debug")]
     fn sync_from_log(&mut self, log: Log) -> Result<(), EventLogError> {
         let event_signature = log.topics[0];
 
         if event_signature == SYNC_EVENT_SIGNATURE {
+            let new_log_index = (
+                log.block_number.clone().ok_or(EventLogError::LogBlockNumberNotFound)?.as_u64(),
+                log.log_index.clone().ok_or(EventLogError::LogIndexNotFound)?.as_u64(),
+            );
+
+            if new_log_index <= self.last_synced {
+                tracing::info!(log = ?new_log_index, last_synced = ?self.last_synced, "Skipping sync event");
+                return Err(EventLogError::LogAlreadySynced);
+            }
+
             let sync_event = SyncFilter::decode_log(&RawLog::from(log))?;
             tracing::info!(reserve_0 = sync_event.reserve_0, reserve_1 = sync_event.reserve_1, address = ?self.address, "UniswapV2 sync event");
 
             self.reserve_0 = sync_event.reserve_0;
             self.reserve_1 = sync_event.reserve_1;
+            self.last_synced = new_log_index;
 
             Ok(())
         } else {
             Err(EventLogError::InvalidEventSignature)
         }
     }
+
+    #[instrument(skip(self, middleware), level = "debug")]
+    async fn populate_data<M: Middleware>(&mut self, _block_number: Option<u64>, middleware: Arc<M>) -> Result<(), AMMError<M>> {
+        batch_request::get_v2_pool_data_batch_request(self, middleware.clone()).await?;
+
+        Ok(())
+    }
+
     //Calculates base/quote, meaning the price of base token per quote (ie. exchange rate is X base per 1 quote)
     fn calculate_price(&self, base_token: H160) -> Result<f64, ArithmeticError> {
         Ok(q64_to_f64(self.calculate_price_64_x_64(base_token)?))
     }
 
-    fn tokens(&self) -> Vec<H160> {
-        vec![self.token_a, self.token_b]
+    fn get_token_out(&self, token_in: H160) -> H160 {
+        if self.token_a == token_in {
+            self.token_b
+        } else {
+            self.token_a
+        }
     }
 
     fn simulate_swap(&self, token_in: H160, amount_in: U256) -> Result<U256, SwapSimulationError> {
@@ -131,11 +151,7 @@ impl AutomatedMarketMaker for UniswapV2Pool {
         }
     }
 
-    fn simulate_swap_mut(
-        &mut self,
-        token_in: H160,
-        amount_in: U256,
-    ) -> Result<U256, SwapSimulationError> {
+    fn simulate_swap_mut(&mut self, token_in: H160, amount_in: U256) -> Result<U256, SwapSimulationError> {
         if self.token_a == token_in {
             let amount_out = self.get_amount_out(
                 amount_in,
@@ -170,14 +186,6 @@ impl AutomatedMarketMaker for UniswapV2Pool {
             Ok(amount_out)
         }
     }
-
-    fn get_token_out(&self, token_in: H160) -> H160 {
-        if self.token_a == token_in {
-            self.token_b
-        } else {
-            self.token_a
-        }
-    }
 }
 
 impl UniswapV2Pool {
@@ -190,9 +198,10 @@ impl UniswapV2Pool {
         token_b_decimals: u8,
         reserve_0: u128,
         reserve_1: u128,
+        last_synced: (u64, u64),
         fee: u32,
-    ) -> UniswapV2Pool {
-        UniswapV2Pool {
+    ) -> Self {
+        Self {
             address,
             token_a,
             token_a_decimals,
@@ -200,25 +209,17 @@ impl UniswapV2Pool {
             token_b_decimals,
             reserve_0,
             reserve_1,
+            last_synced,
             fee,
         }
     }
 
     /// Creates a new instance of the pool from the pair address, and syncs the pool data.
-    pub async fn new_from_address<M: Middleware>(
-        pair_address: H160,
-        fee: u32,
-        middleware: Arc<M>,
-    ) -> Result<Self, AMMError<M>> {
+    pub async fn new_from_address<M: Middleware>(pair_address: H160, fee: u32, middleware: Arc<M>) -> Result<Self, AMMError<M>> {
         let mut pool = UniswapV2Pool {
             address: pair_address,
-            token_a: H160::zero(),
-            token_a_decimals: 0,
-            token_b: H160::zero(),
-            token_b_decimals: 0,
-            reserve_0: 0,
-            reserve_1: 0,
             fee,
+            ..Default::default()
         };
 
         pool.populate_data(None, middleware.clone()).await?;
@@ -233,11 +234,7 @@ impl UniswapV2Pool {
     /// Creates a new instance of a the pool from a `PairCreated` event log.
     ///
     /// This method syncs the pool data.
-    pub async fn new_from_log<M: Middleware>(
-        log: Log,
-        fee: u32,
-        middleware: Arc<M>,
-    ) -> Result<Self, AMMError<M>> {
+    pub async fn new_from_log<M: Middleware>(log: Log, fee: u32, middleware: Arc<M>) -> Result<Self, AMMError<M>> {
         let event_signature = log.topics[0];
 
         if event_signature == PAIR_CREATED_EVENT_SIGNATURE {
@@ -261,11 +258,7 @@ impl UniswapV2Pool {
                 address: pair_created_event.pair,
                 token_a: pair_created_event.token_0,
                 token_b: pair_created_event.token_1,
-                token_a_decimals: 0,
-                token_b_decimals: 0,
-                reserve_0: 0,
-                reserve_1: 0,
-                fee: 0,
+                ..Default::default()
             })
         } else {
             Err(EventLogError::InvalidEventSignature)?
@@ -279,17 +272,11 @@ impl UniswapV2Pool {
 
     /// Returns whether the pool data is populated.
     pub fn data_is_populated(&self) -> bool {
-        !(self.token_a.is_zero()
-            || self.token_b.is_zero()
-            || self.reserve_0 == 0
-            || self.reserve_1 == 0)
+        !(self.token_a.is_zero() || self.token_b.is_zero() || self.reserve_0 == 0 || self.reserve_1 == 0)
     }
 
     /// Returns the reserves of the pool.
-    pub async fn get_reserves<M: Middleware>(
-        &self,
-        middleware: Arc<M>,
-    ) -> Result<(u128, u128), AMMError<M>> {
+    pub async fn get_reserves<M: Middleware>(&self, middleware: Arc<M>) -> Result<(u128, u128), AMMError<M>> {
         tracing::trace!("getting reserves of {}", self.address);
 
         //Initialize a new instance of the Pool
@@ -305,10 +292,7 @@ impl UniswapV2Pool {
         Ok((reserve_0, reserve_1))
     }
 
-    pub async fn get_token_decimals<M: Middleware>(
-        &mut self,
-        middleware: Arc<M>,
-    ) -> Result<(u8, u8), AMMError<M>> {
+    pub async fn get_token_decimals<M: Middleware>(&mut self, middleware: Arc<M>) -> Result<(u8, u8), AMMError<M>> {
         let token_a_decimals = IErc20::new(self.token_a, middleware.clone())
             .decimals()
             .call()
@@ -324,11 +308,7 @@ impl UniswapV2Pool {
         Ok((token_a_decimals, token_b_decimals))
     }
 
-    pub async fn get_token_0<M: Middleware>(
-        &self,
-        pair_address: H160,
-        middleware: Arc<M>,
-    ) -> Result<H160, AMMError<M>> {
+    pub async fn get_token_0<M: Middleware>(&self, pair_address: H160, middleware: Arc<M>) -> Result<H160, AMMError<M>> {
         let v2_pair = IUniswapV2Pair::new(pair_address, middleware);
 
         let token0 = match v2_pair.token_0().call().await {
@@ -339,11 +319,7 @@ impl UniswapV2Pool {
         Ok(token0)
     }
 
-    pub async fn get_token_1<M: Middleware>(
-        &self,
-        pair_address: H160,
-        middleware: Arc<M>,
-    ) -> Result<H160, AMMError<M>> {
+    pub async fn get_token_1<M: Middleware>(&self, pair_address: H160, middleware: Arc<M>) -> Result<H160, AMMError<M>> {
         let v2_pair = IUniswapV2Pair::new(pair_address, middleware);
 
         let token1 = match v2_pair.token_1().call().await {
@@ -404,13 +380,7 @@ impl UniswapV2Pool {
     }
 
     /// Returns the calldata for a swap.
-    pub fn swap_calldata(
-        &self,
-        amount_0_out: U256,
-        amount_1_out: U256,
-        to: H160,
-        calldata: Vec<u8>,
-    ) -> Result<Bytes, ethers::abi::Error> {
+    pub fn swap_calldata(&self, amount_0_out: U256, amount_1_out: U256, to: H160, calldata: Vec<u8>) -> Result<Bytes, ethers::abi::Error> {
         let input_tokens = vec![
             Token::Uint(amount_0_out),
             Token::Uint(amount_1_out),
@@ -418,9 +388,7 @@ impl UniswapV2Pool {
             Token::Bytes(calldata),
         ];
 
-        IUNISWAPV2PAIR_ABI
-            .function("swap")?
-            .encode_input(&input_tokens)
+        IUNISWAPV2PAIR_ABI.function("swap")?.encode_input(&input_tokens)
     }
 }
 
@@ -577,7 +545,7 @@ mod tests {
             300,
             middleware.clone(),
         )
-        .await?;
+            .await?;
 
         assert_eq!(
             pool.address,
@@ -640,6 +608,7 @@ mod tests {
             token_b_decimals: 9,
             reserve_0: 23595096345912178729927,
             reserve_1: 154664232014390554564,
+            last_synced: (0, 0),
             fee: 300,
         };
 
@@ -648,6 +617,7 @@ mod tests {
 
         Ok(())
     }
+
     #[tokio::test]
     async fn test_calculate_price() -> eyre::Result<()> {
         let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
@@ -672,6 +642,7 @@ mod tests {
 
         Ok(())
     }
+
     #[tokio::test]
     async fn test_calculate_price_64_x_64() -> eyre::Result<()> {
         let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;

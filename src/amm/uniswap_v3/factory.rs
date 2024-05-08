@@ -8,18 +8,18 @@ use ethers::{
     abi::RawLog,
     prelude::{abigen, EthEvent},
     providers::Middleware,
-    types::{BlockNumber, Filter, Log, H160, H256, U256, U64},
+    types::{BlockNumber, Filter, H160, H256, Log, U64},
 };
 use futures::{stream::FuturesOrdered, StreamExt};
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
 use crate::{
-    amm::{factory::AutomatedMarketMakerFactory, AutomatedMarketMaker, AMM},
+    amm::{AMM, AutomatedMarketMaker, factory::AutomatedMarketMakerFactory},
     errors::{AMMError, EventLogError},
 };
 
-use super::{batch_request, UniswapV3Pool, BURN_EVENT_SIGNATURE, MINT_EVENT_SIGNATURE};
+use super::{batch_request, BURN_EVENT_SIGNATURE, MINT_EVENT_SIGNATURE, UniswapV3Pool};
 
 abigen!(
     IUniswapV3Factory,
@@ -56,6 +56,19 @@ impl AutomatedMarketMakerFactory for UniswapV3Factory {
         POOL_CREATED_EVENT_SIGNATURE
     }
 
+    async fn get_all_amms<M: 'static + Middleware>(
+        &self,
+        to_block: Option<u64>,
+        middleware: Arc<M>,
+        step: u64,
+    ) -> Result<Vec<AMM>, AMMError<M>> {
+        if let Some(block) = to_block {
+            self.get_all_pools_from_logs(block, step, middleware).await
+        } else {
+            return Err(AMMError::BlockNumberNotFound);
+        }
+    }
+
     async fn new_amm_from_log<M: 'static + Middleware>(
         &self,
         log: Log,
@@ -69,24 +82,23 @@ impl AutomatedMarketMakerFactory for UniswapV3Factory {
                     block_number.as_u64(),
                     middleware,
                 )
-                .await?,
+                    .await?,
             ))
         } else {
             return Err(AMMError::BlockNumberNotFound);
         }
     }
 
-    async fn get_all_amms<M: 'static + Middleware>(
-        &self,
-        to_block: Option<u64>,
-        middleware: Arc<M>,
-        step: u64,
-    ) -> Result<Vec<AMM>, AMMError<M>> {
-        if let Some(block) = to_block {
-            self.get_all_pools_from_logs(block, step, middleware).await
-        } else {
-            return Err(AMMError::BlockNumberNotFound);
-        }
+    fn new_empty_amm_from_log(&self, log: Log) -> Result<AMM, ethers::abi::Error> {
+        let pool_created_event = PoolCreatedFilter::decode_log(&RawLog::from(log))?;
+
+        Ok(AMM::UniswapV3Pool(UniswapV3Pool {
+            address: pool_created_event.pool,
+            token_a: pool_created_event.token_0,
+            token_b: pool_created_event.token_1,
+            fee: pool_created_event.fee,
+            ..Default::default()
+        }))
     }
 
     #[instrument(skip(self, amms, middleware) level = "debug")]
@@ -104,32 +116,13 @@ impl AutomatedMarketMakerFactory for UniswapV3Factory {
                     block_number,
                     middleware.clone(),
                 )
-                .await?;
+                    .await?;
             }
         } else {
             return Err(AMMError::BlockNumberNotFound);
         }
 
         Ok(())
-    }
-
-    fn new_empty_amm_from_log(&self, log: Log) -> Result<AMM, ethers::abi::Error> {
-        let pool_created_event = PoolCreatedFilter::decode_log(&RawLog::from(log))?;
-
-        Ok(AMM::UniswapV3Pool(UniswapV3Pool {
-            address: pool_created_event.pool,
-            token_a: pool_created_event.token_0,
-            token_b: pool_created_event.token_1,
-            token_a_decimals: 0,
-            token_b_decimals: 0,
-            fee: pool_created_event.fee,
-            liquidity: 0,
-            sqrt_price: U256::zero(),
-            tick_spacing: 0,
-            tick: 0,
-            tick_bitmap: HashMap::new(),
-            ticks: HashMap::new(),
-        }))
     }
 }
 

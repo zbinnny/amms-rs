@@ -5,19 +5,18 @@ use ethers::{
     abi::RawLog,
     prelude::EthEvent,
     providers::Middleware,
-    types::{Log, H160, H256, U256},
+    types::{H160, H256, Log, U256},
 };
-
-use crate::{
-    amm::{factory::AutomatedMarketMakerFactory, AMM},
-    errors::AMMError,
-};
+use ethers::prelude::abigen;
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
-use super::{batch_request, UniswapV2Pool};
+use crate::{
+    amm::{AMM, factory::AutomatedMarketMakerFactory},
+    errors::AMMError,
+};
 
-use ethers::prelude::abigen;
+use super::{batch_request, UniswapV2Pool};
 
 abigen!(
     IUniswapV2Factory,
@@ -51,10 +50,7 @@ impl UniswapV2Factory {
         }
     }
 
-    pub async fn get_all_pairs_via_batched_calls<M: Middleware>(
-        &self,
-        middleware: Arc<M>,
-    ) -> Result<Vec<AMM>, AMMError<M>> {
+    pub async fn get_all_pairs_via_batched_calls<M: Middleware>(&self, middleware: Arc<M>) -> Result<Vec<AMM>, AMMError<M>> {
         let factory = IUniswapV2Factory::new(self.address, middleware.clone());
 
         let pairs_length: U256 = factory.all_pairs_length().call().await?;
@@ -76,7 +72,7 @@ impl UniswapV2Factory {
                     idx_to,
                     middleware.clone(),
                 )
-                .await?,
+                    .await?,
             );
 
             idx_from = idx_to;
@@ -110,8 +106,22 @@ impl AutomatedMarketMakerFactory for UniswapV2Factory {
         self.address
     }
 
+    fn creation_block(&self) -> u64 {
+        self.creation_block
+    }
+
     fn amm_created_event_signature(&self) -> H256 {
         PAIR_CREATED_EVENT_SIGNATURE
+    }
+
+    #[instrument(skip(self, middleware) level = "debug")]
+    async fn get_all_amms<M: Middleware>(
+        &self,
+        _to_block: Option<u64>,
+        middleware: Arc<M>,
+        _step: u64,
+    ) -> Result<Vec<AMM>, AMMError<M>> {
+        self.get_all_pairs_via_batched_calls(middleware).await
     }
 
     async fn new_amm_from_log<M: 'static + Middleware>(
@@ -119,8 +129,7 @@ impl AutomatedMarketMakerFactory for UniswapV2Factory {
         log: Log,
         middleware: Arc<M>,
     ) -> Result<AMM, AMMError<M>> {
-        let pair_created_event: PairCreatedFilter =
-            PairCreatedFilter::decode_log(&RawLog::from(log))?;
+        let pair_created_event = PairCreatedFilter::decode_log(&RawLog::from(log))?;
         Ok(AMM::UniswapV2Pool(
             UniswapV2Pool::new_from_address(pair_created_event.pair, self.fee, middleware).await?,
         ))
@@ -133,22 +142,9 @@ impl AutomatedMarketMakerFactory for UniswapV2Factory {
             address: pair_created_event.pair,
             token_a: pair_created_event.token_0,
             token_b: pair_created_event.token_1,
-            token_a_decimals: 0,
-            token_b_decimals: 0,
-            reserve_0: 0,
-            reserve_1: 0,
-            fee: 0,
+            fee: self.fee,
+            ..Default::default()
         }))
-    }
-
-    #[instrument(skip(self, middleware) level = "debug")]
-    async fn get_all_amms<M: Middleware>(
-        &self,
-        _to_block: Option<u64>,
-        middleware: Arc<M>,
-        _step: u64,
-    ) -> Result<Vec<AMM>, AMMError<M>> {
-        self.get_all_pairs_via_batched_calls(middleware).await
     }
 
     async fn populate_amm_data<M: Middleware>(
@@ -162,9 +158,5 @@ impl AutomatedMarketMakerFactory for UniswapV2Factory {
             batch_request::get_amm_data_batch_request(amm_chunk, middleware.clone()).await?;
         }
         Ok(())
-    }
-
-    fn creation_block(&self) -> u64 {
-        self.creation_block
     }
 }

@@ -1,15 +1,16 @@
+use std::time::SystemTimeError;
+
 use ethers::prelude::{AbiError, ContractError};
 use ethers::providers::{Middleware, ProviderError};
 use ethers::types::{H160, U256};
-use std::time::SystemTimeError;
 use thiserror::Error;
 use tokio::task::JoinError;
 use uniswap_v3_math::error::UniswapV3MathError;
 
 #[derive(Error, Debug)]
 pub enum AMMError<M>
-where
-    M: Middleware,
+    where
+        M: Middleware,
 {
     #[error("Middleware error")]
     MiddlewareError(<M as Middleware>::Error),
@@ -83,6 +84,10 @@ pub enum EventLogError {
     InvalidEventSignature,
     #[error("Log Block number not found")]
     LogBlockNumberNotFound,
+    #[error("Log Index not found")]
+    LogIndexNotFound,
+    #[error("Log already synced")]
+    LogAlreadySynced,
     #[error("Eth abi error")]
     EthABIError(#[from] ethers::abi::Error),
     #[error("ABI error")]

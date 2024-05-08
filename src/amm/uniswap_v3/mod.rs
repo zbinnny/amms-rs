@@ -1,30 +1,31 @@
-pub mod batch_request;
-pub mod factory;
-
-use crate::{
-    amm::AutomatedMarketMaker,
-    errors::{AMMError, ArithmeticError, EventLogError, SwapSimulationError},
-};
-use async_trait::async_trait;
-use ethers::{
-    abi::{ethabi::Bytes, RawLog, Token},
-    prelude::{AbiError, EthEvent},
-    providers::Middleware,
-    types::{BlockNumber, Filter, Log, H160, H256, I256, U256, U64},
-};
-use futures::{stream::FuturesOrdered, StreamExt};
-use num_bigfloat::BigFloat;
-use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap},
     sync::Arc,
 };
+
+use async_trait::async_trait;
+use ethers::{
+    abi::{ethabi::Bytes, RawLog, Token},
+    prelude::{AbiError, EthEvent},
+    providers::Middleware,
+    types::{BlockNumber, Filter, H160, H256, I256, Log, U256, U64},
+};
+use ethers::prelude::abigen;
+use futures::{stream::FuturesOrdered, StreamExt};
+use num_bigfloat::BigFloat;
+use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
-use ethers::prelude::abigen;
+use crate::{
+    amm::AutomatedMarketMaker,
+    errors::{AMMError, ArithmeticError, EventLogError, SwapSimulationError},
+};
 
 use self::factory::POOL_CREATED_EVENT_SIGNATURE;
+
+pub mod batch_request;
+pub mod factory;
 
 abigen!(
 
@@ -82,6 +83,7 @@ pub const MINT_EVENT_SIGNATURE: H256 = H256([
 pub const U256_TWO: U256 = U256([2, 0, 0, 0]);
 pub const Q128: U256 = U256([0, 0, 1, 0]);
 pub const Q224: U256 = U256([0, 0, 0, 4294967296]);
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UniswapV3Pool {
     pub address: H160,
@@ -96,6 +98,8 @@ pub struct UniswapV3Pool {
     pub tick_spacing: i32,
     pub tick_bitmap: HashMap<i16, U256>,
     pub ticks: HashMap<i32, Info>,
+    #[serde(default)]
+    pub last_synced: (u64, u64),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -121,10 +125,12 @@ impl AutomatedMarketMaker for UniswapV3Pool {
         self.address
     }
 
-    #[instrument(skip(self, middleware), level = "debug")]
-    async fn sync<M: Middleware>(&mut self, middleware: Arc<M>) -> Result<(), AMMError<M>> {
-        batch_request::sync_v3_pool_batch_request(self, middleware.clone()).await?;
-        Ok(())
+    fn tokens(&self) -> Vec<H160> {
+        vec![self.token_a, self.token_b]
+    }
+
+    fn last_synced_log(&self) -> (u64, u64) {
+        self.last_synced
     }
 
     //This defines the event signatures to listen to that will produce events to be passed into AMM::sync_from_log()
@@ -136,9 +142,23 @@ impl AutomatedMarketMaker for UniswapV3Pool {
         ]
     }
 
+    #[instrument(skip(self, middleware), level = "debug")]
+    async fn sync<M: Middleware>(&mut self, middleware: Arc<M>) -> Result<(), AMMError<M>> {
+        batch_request::sync_v3_pool_batch_request(self, middleware.clone()).await?;
+        Ok(())
+    }
+
     #[instrument(skip(self), level = "debug")]
     fn sync_from_log(&mut self, log: Log) -> Result<(), EventLogError> {
         let event_signature = log.topics[0];
+
+        let block_number = log.block_number.clone().ok_or(EventLogError::LogBlockNumberNotFound)?.as_u64();
+        let log_index = log.log_index.clone().ok_or(EventLogError::LogIndexNotFound)?.as_u64();
+
+        // 判断是否是已经同步过的日志
+        if (block_number, log_index) <= self.last_synced {
+            return Err(EventLogError::LogAlreadySynced);
+        }
 
         if event_signature == BURN_EVENT_SIGNATURE {
             self.sync_from_burn_log(log)?;
@@ -150,11 +170,20 @@ impl AutomatedMarketMaker for UniswapV3Pool {
             Err(EventLogError::InvalidEventSignature)?
         }
 
+        self.last_synced = (block_number, log_index);
+
         Ok(())
     }
 
-    fn tokens(&self) -> Vec<H160> {
-        vec![self.token_a, self.token_b]
+    // NOTE: This function will not populate the tick_bitmap and ticks, if you want to populate those, you must call populate_tick_data on an initialized pool
+    async fn populate_data<M: Middleware>(
+        &mut self,
+        block_number: Option<u64>,
+        middleware: Arc<M>,
+    ) -> Result<(), AMMError<M>> {
+        batch_request::get_v3_pool_data_batch_request(self, block_number, middleware.clone())
+            .await?;
+        Ok(())
     }
 
     fn calculate_price(&self, base_token: H160) -> Result<f64, ArithmeticError> {
@@ -173,15 +202,13 @@ impl AutomatedMarketMaker for UniswapV3Pool {
             Ok(1.0 / price)
         }
     }
-    // NOTE: This function will not populate the tick_bitmap and ticks, if you want to populate those, you must call populate_tick_data on an initialized pool
-    async fn populate_data<M: Middleware>(
-        &mut self,
-        block_number: Option<u64>,
-        middleware: Arc<M>,
-    ) -> Result<(), AMMError<M>> {
-        batch_request::get_v3_pool_data_batch_request(self, block_number, middleware.clone())
-            .await?;
-        Ok(())
+
+    fn get_token_out(&self, token_in: H160) -> H160 {
+        if self.token_a == token_in {
+            self.token_b
+        } else {
+            self.token_a
+        }
     }
 
     fn simulate_swap(&self, token_in: H160, amount_in: U256) -> Result<U256, SwapSimulationError> {
@@ -316,11 +343,7 @@ impl AutomatedMarketMaker for UniswapV3Pool {
         Ok(amount_out)
     }
 
-    fn simulate_swap_mut(
-        &mut self,
-        token_in: H160,
-        amount_in: U256,
-    ) -> Result<U256, SwapSimulationError> {
+    fn simulate_swap_mut(&mut self, token_in: H160, amount_in: U256) -> Result<U256, SwapSimulationError> {
         if amount_in.is_zero() {
             return Ok(U256::zero());
         }
@@ -456,14 +479,6 @@ impl AutomatedMarketMaker for UniswapV3Pool {
 
         Ok(amount_out)
     }
-
-    fn get_token_out(&self, token_in: H160) -> H160 {
-        if self.token_a == token_in {
-            self.token_b
-        } else {
-            self.token_a
-        }
-    }
 }
 
 impl UniswapV3Pool {
@@ -481,6 +496,7 @@ impl UniswapV3Pool {
         tick_spacing: i32,
         tick_bitmap: HashMap<i16, U256>,
         ticks: HashMap<i32, Info>,
+        last_synced: (u64, u64),
     ) -> UniswapV3Pool {
         UniswapV3Pool {
             address,
@@ -495,6 +511,7 @@ impl UniswapV3Pool {
             tick_spacing,
             tick_bitmap,
             ticks,
+            last_synced,
         }
     }
 
@@ -508,17 +525,7 @@ impl UniswapV3Pool {
     ) -> Result<Self, AMMError<M>> {
         let mut pool = UniswapV3Pool {
             address: pair_address,
-            token_a: H160::zero(),
-            token_a_decimals: 0,
-            token_b: H160::zero(),
-            token_b_decimals: 0,
-            liquidity: 0,
-            sqrt_price: U256::zero(),
-            tick: 0,
-            tick_spacing: 0,
-            fee: 0,
-            tick_bitmap: HashMap::new(),
-            ticks: HashMap::new(),
+            ..Default::default()
         };
 
         //We need to get tick spacing before populating tick data because tick spacing can not be uninitialized when syncing burn and mint logs
@@ -556,7 +563,7 @@ impl UniswapV3Pool {
                     block_number.as_u64(),
                     middleware,
                 )
-                .await
+                    .await
             } else {
                 Err(EventLogError::LogBlockNumberNotFound)?
             }
@@ -577,15 +584,8 @@ impl UniswapV3Pool {
                 address: pool_created_event.pool,
                 token_a: pool_created_event.token_0,
                 token_b: pool_created_event.token_1,
-                token_a_decimals: 0,
-                token_b_decimals: 0,
                 fee: pool_created_event.fee,
-                liquidity: 0,
-                sqrt_price: U256::zero(),
-                tick_spacing: 0,
-                tick: 0,
-                tick_bitmap: HashMap::new(),
-                ticks: HashMap::new(),
+                ..Default::default()
             })
         } else {
             Err(EventLogError::InvalidEventSignature)
@@ -782,6 +782,7 @@ impl UniswapV3Pool {
             burn_event.tick_upper,
             -(burn_event.amount as i128),
         );
+
 
         tracing::debug!(?burn_event, address = ?self.address, sqrt_price = ?self.sqrt_price, liquidity = ?self.liquidity, tick = ?self.tick, "UniswapV3 burn event");
 
@@ -1067,15 +1068,10 @@ pub struct Tick {
 
 #[cfg(test)]
 mod test {
-    use super::IUniswapV3Pool;
     #[allow(unused)]
+    use std::{str::FromStr, sync::Arc};
     #[allow(unused)]
-    use super::UniswapV3Pool;
-
-    use crate::amm::AutomatedMarketMaker;
-
-    #[allow(unused)]
-    use ethers::providers::Middleware;
+    use std::error::Error;
 
     #[allow(unused)]
     use ethers::{
@@ -1084,9 +1080,15 @@ mod test {
         types::{H160, U256},
     };
     #[allow(unused)]
-    use std::error::Error;
+    use ethers::providers::Middleware;
+
+    use crate::amm::AutomatedMarketMaker;
+
+    use super::IUniswapV3Pool;
     #[allow(unused)]
-    use std::{str::FromStr, sync::Arc};
+    #[allow(unused)]
+    use super::UniswapV3Pool;
+
     abigen!(
         IQuoter,
     r#"[
@@ -1810,7 +1812,7 @@ mod test {
             12369620,
             middleware.clone(),
         )
-        .await?;
+            .await?;
 
         assert_eq!(
             pool.address,

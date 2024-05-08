@@ -1,5 +1,3 @@
-pub mod batch_request;
-
 use std::{cmp::Ordering, sync::Arc};
 
 use async_trait::async_trait;
@@ -7,8 +5,9 @@ use ethers::{
     abi::RawLog,
     prelude::EthEvent,
     providers::Middleware,
-    types::{Log, H160, H256, U256},
+    types::{H160, H256, Log, U256},
 };
+use ethers::prelude::abigen;
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
@@ -17,9 +16,9 @@ use crate::{
     errors::{AMMError, ArithmeticError, EventLogError, SwapSimulationError},
 };
 
-use ethers::prelude::abigen;
-
 use super::uniswap_v2::{div_uu, q64_to_f64, U128_0X10000000000000000};
+
+pub mod batch_request;
 
 abigen!(
     IERC4626Vault,
@@ -45,14 +44,21 @@ pub const WITHDRAW_EVENT_SIGNATURE: H256 = H256([
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ERC4626Vault {
-    pub vault_token: H160, // token received from depositing, i.e. shares token
+    // token received from depositing, i.e. shares token
+    pub vault_token: H160,
     pub vault_token_decimals: u8,
-    pub asset_token: H160, // token received from withdrawing, i.e. underlying token
+    // token received from withdrawing, i.e. underlying token
+    pub asset_token: H160,
     pub asset_token_decimals: u8,
-    pub vault_reserve: U256, // total supply of vault tokens
-    pub asset_reserve: U256, // total balance of asset tokens held by vault
-    pub deposit_fee: u32,    // deposit fee in basis points
-    pub withdraw_fee: u32,   // withdrawal fee in basis points
+    // total supply of vault tokens
+    pub vault_reserve: U256,
+    // total balance of asset tokens held by vault
+    pub asset_reserve: U256,
+    // deposit fee in basis points
+    pub deposit_fee: u32,
+    // withdrawal fee in basis points
+    pub withdraw_fee: u32,
+    pub last_synced: (u64, u64),
 }
 
 #[async_trait]
@@ -65,8 +71,12 @@ impl AutomatedMarketMaker for ERC4626Vault {
         vec![self.vault_token, self.asset_token]
     }
 
-    fn calculate_price(&self, base_token: H160) -> Result<f64, ArithmeticError> {
-        Ok(q64_to_f64(self.calculate_price_64_x_64(base_token)?))
+    fn last_synced_log(&self) -> (u64, u64) {
+        self.last_synced
+    }
+
+    fn sync_on_event_signatures(&self) -> Vec<H256> {
+        vec![DEPOSIT_EVENT_SIGNATURE, WITHDRAW_EVENT_SIGNATURE]
     }
 
     #[instrument(skip(self, middleware), level = "debug")]
@@ -80,13 +90,17 @@ impl AutomatedMarketMaker for ERC4626Vault {
         Ok(())
     }
 
-    fn sync_on_event_signatures(&self) -> Vec<H256> {
-        vec![DEPOSIT_EVENT_SIGNATURE, WITHDRAW_EVENT_SIGNATURE]
-    }
-
     #[instrument(skip(self), level = "debug")]
     fn sync_from_log(&mut self, log: Log) -> Result<(), EventLogError> {
         let event_signature = log.topics[0];
+
+        let block_number = log.block_number.clone().ok_or(EventLogError::LogBlockNumberNotFound)?.as_u64();
+        let log_index = log.log_index.clone().ok_or(EventLogError::LogIndexNotFound)?.as_u64();
+
+        if (block_number, log_index) <= self.last_synced {
+            return Err(EventLogError::LogAlreadySynced);
+        }
+
         if event_signature == DEPOSIT_EVENT_SIGNATURE {
             let deposit_event = DepositFilter::decode_log(&RawLog::from(log))?;
             self.asset_reserve += deposit_event.assets;
@@ -100,6 +114,8 @@ impl AutomatedMarketMaker for ERC4626Vault {
         } else {
             return Err(EventLogError::InvalidEventSignature);
         }
+
+        self.last_synced = (block_number, log_index);
 
         Ok(())
     }
@@ -115,6 +131,18 @@ impl AutomatedMarketMaker for ERC4626Vault {
         Ok(())
     }
 
+    fn calculate_price(&self, base_token: H160) -> Result<f64, ArithmeticError> {
+        Ok(q64_to_f64(self.calculate_price_64_x_64(base_token)?))
+    }
+
+    fn get_token_out(&self, token_in: H160) -> H160 {
+        if self.vault_token == token_in {
+            self.asset_token
+        } else {
+            self.vault_token
+        }
+    }
+
     fn simulate_swap(&self, token_in: H160, amount_in: U256) -> Result<U256, SwapSimulationError> {
         if self.vault_token == token_in {
             Ok(self.get_amount_out(amount_in, self.vault_reserve, self.asset_reserve))
@@ -123,11 +151,7 @@ impl AutomatedMarketMaker for ERC4626Vault {
         }
     }
 
-    fn simulate_swap_mut(
-        &mut self,
-        token_in: H160,
-        amount_in: U256,
-    ) -> Result<U256, SwapSimulationError> {
+    fn simulate_swap_mut(&mut self, token_in: H160, amount_in: U256) -> Result<U256, SwapSimulationError> {
         if self.vault_token == token_in {
             let amount_out = self.get_amount_out(amount_in, self.vault_reserve, self.asset_reserve);
 
@@ -144,14 +168,6 @@ impl AutomatedMarketMaker for ERC4626Vault {
             Ok(amount_out)
         }
     }
-
-    fn get_token_out(&self, token_in: H160) -> H160 {
-        if self.vault_token == token_in {
-            self.asset_token
-        } else {
-            self.vault_token
-        }
-    }
 }
 
 impl ERC4626Vault {
@@ -165,6 +181,7 @@ impl ERC4626Vault {
         asset_reserve: U256,
         deposit_fee: u32,
         withdraw_fee: u32,
+        last_synced: (u64, u64),
     ) -> ERC4626Vault {
         ERC4626Vault {
             vault_token,
@@ -175,22 +192,14 @@ impl ERC4626Vault {
             asset_reserve,
             deposit_fee,
             withdraw_fee,
+            last_synced,
         }
     }
 
-    pub async fn new_from_address<M: Middleware>(
-        vault_token: H160,
-        middleware: Arc<M>,
-    ) -> Result<Self, AMMError<M>> {
+    pub async fn new_from_address<M: Middleware>(vault_token: H160, middleware: Arc<M>) -> Result<Self, AMMError<M>> {
         let mut vault = ERC4626Vault {
             vault_token,
-            vault_token_decimals: 0,
-            asset_token: H160::zero(),
-            asset_token_decimals: 0,
-            vault_reserve: U256::zero(),
-            asset_reserve: U256::zero(),
-            deposit_fee: 0,
-            withdraw_fee: 0,
+            ..Default::default()
         };
 
         vault.populate_data(None, middleware.clone()).await?;
@@ -252,7 +261,7 @@ impl ERC4626Vault {
             } else {
                 Ok(div_uu(r_a, r_v)?)
             }
-        // Deposit
+            // Deposit
         } else if r_a.is_zero() {
             // Return 1 in Q64
             Ok(U128_0X10000000000000000)
