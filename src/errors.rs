@@ -9,8 +9,8 @@ use uniswap_v3_math::error::UniswapV3MathError;
 
 #[derive(Error, Debug)]
 pub enum AMMError<M>
-    where
-        M: Middleware,
+where
+    M: Middleware,
 {
     #[error("Middleware error")]
     MiddlewareError(<M as Middleware>::Error),
@@ -60,6 +60,8 @@ pub enum AMMError<M>
     BatchRequestError(H160),
     #[error("Checkpoint error")]
     CheckpointError(#[from] CheckpointError),
+    #[error("Currency error")]
+    CurrencyError(#[from] CurrencyError),
 }
 
 #[derive(Error, Debug)]
@@ -112,4 +114,18 @@ pub enum CheckpointError {
     SerdeJsonError(#[from] serde_json::error::Error),
     #[error("IO error")]
     IOError(#[from] std::io::Error),
+}
+
+#[derive(Error, Debug)]
+pub enum CurrencyError {
+    #[error("Invalid return data")]
+    InvalidReturnData,
+    #[error("Invalid currency")]
+    InvalidCurrency,
+    #[error("Invalid currency symbol")]
+    InvalidCurrencySymbol,
+    #[error("Invalid currency decimals")]
+    InvalidCurrencyDecimals,
+    #[error("Invalid currency address")]
+    InvalidCurrencyAddress,
 }

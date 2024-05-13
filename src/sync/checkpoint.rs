@@ -1,288 +1,361 @@
 use std::{
+    cmp::min,
+    collections::{HashMap, HashSet},
     fs::read_to_string,
-    panic::resume_unwind,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
-use ethers::{providers::Middleware, types::H160};
-
+use ethers::{
+    prelude::{Filter, H160, H256},
+    providers::Middleware,
+};
+use ethers::prelude::{Address, Log, StreamExt};
+use futures::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
-
-use tokio::task::JoinHandle;
 
 use crate::{
     amm::{
-        factory::{AutomatedMarketMakerFactory, Factory},
-        uniswap_v2::factory::UniswapV2Factory,
-        uniswap_v3::factory::UniswapV3Factory,
         AMM,
+        AutomatedMarketMaker,
+        factory::{AutomatedMarketMakerFactory, FactoryHelper}, factory::Factory,
     },
-    errors::{AMMError, CheckpointError},
-    filters,
+    currency::{batch_get_currency_info, Currency},
+    errors::{AMMError, CheckpointError, EventLogError},
+    sync::serde_with::*,
 };
 
-use super::amms_are_congruent;
-
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Checkpoint {
-    pub timestamp: usize,
-    pub block_number: u64,
-    pub factories: Vec<Factory>,
-    pub amms: Vec<AMM>,
+    pub block_number: Option<u64>,
+    #[serde(
+        serialize_with = "serialize_map_to_vec",
+        deserialize_with = "deserialize_vec_to_map"
+    )]
+    pub factories: HashMap<H160, Factory>,
+    #[serde(
+        serialize_with = "serialize_map_to_vec",
+        deserialize_with = "deserialize_vec_to_map"
+    )]
+    pub amms: HashMap<H160, AMM>,
+    #[serde(
+        serialize_with = "serialize_map_to_vec",
+        deserialize_with = "deserialize_vec_to_map"
+    )]
+    pub currencies: HashMap<H160, Currency>,
+    // 货币黑名单, 用于过滤掉无效的货币
+    pub currencies_blacklist: HashSet<Address>,
 }
 
 impl Checkpoint {
-    pub fn new(
-        timestamp: usize,
-        block_number: u64,
-        factories: Vec<Factory>,
-        amms: Vec<AMM>,
-    ) -> Checkpoint {
+    pub fn new_from_factories(factories: HashMap<H160, Factory>) -> Checkpoint {
         Checkpoint {
-            timestamp,
-            block_number,
             factories,
-            amms,
+            ..Default::default()
         }
+    }
+
+    /// 从文件创建新的 Checkpoint
+    pub fn new_from_file(path: &str) -> Result<Checkpoint, CheckpointError> {
+        let checkpoint: Checkpoint = serde_json::from_str(read_to_string(path)?.as_str())?;
+        Ok(checkpoint)
+    }
+
+    /// 保存到文件
+    pub fn save_to_file(&self, path: &str) -> Result<(), CheckpointError> {
+        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+        Ok(())
+    }
+
+    /// 合并Checkpoint
+    pub fn extend(&mut self, other: Checkpoint) {
+        self.block_number = min(self.block_number, other.block_number);
+        self.factories.extend(other.factories);
+        self.amms.extend(other.amms);
+    }
+
+    pub fn block_number(&self) -> u64 {
+        match self.block_number {
+            None => self
+                .factories
+                .iter()
+                .map(|(_, factory)| factory.creation_block())
+                .min()
+                .unwrap_or_default(), // 区块号为空时从工厂创建的区块开始
+            Some(block) => block,
+        }
+    }
+
+    /// 最后同步的日志所在的区块, 如果不存在则返回Checkpoint中最早的工厂创建区块
+    pub fn last_synced_log_block(&self) -> u64 {
+        let last_synced_block = self
+            .amms
+            .iter()
+            .map(|(_, amm)| amm.last_synced_log().0)
+            .max()
+            .unwrap_or(0);
+
+
+        if last_synced_block == 0 {
+            self.factories
+                .iter()
+                .map(|(_, factory)| factory.creation_block())
+                .min()
+                .unwrap_or_default()
+        } else {
+            last_synced_block
+        }
+    }
+
+    /// 删除包含无效货币的amm
+    fn remove_invalid_amm(&mut self) {
+        if self.currencies_blacklist.is_empty() {
+            return;
+        }
+
+        // 找出黑名单中的货币对应的交易对
+        let mut amms_to_remove = vec![];
+        for (address, amm) in self.amms.iter() {
+            let tokens = amm.tokens();
+
+            for token in tokens.iter() {
+                if self.currencies_blacklist.contains(token) {
+                    amms_to_remove.push(address.clone());
+                    break;
+                }
+            }
+        }
+
+        // 删除无效交易对
+        for address in amms_to_remove {
+            self.amms.remove(&address);
+        }
+    }
+
+    /// 查找新的amms池子
+    pub async fn find_new_amms<M: 'static + Middleware>(
+        &mut self,
+        middleware: Arc<M>,
+    ) -> Result<(), AMMError<M>> {
+        // 加载新的amms
+        let start_block = self.block_number();
+        tracing::info!(
+            "根据factory合约地址加载新的amms池子. start_block: {}",
+            start_block
+        );
+        let (new_amms, end_block) = FactoryHelper::new(self.factories.clone())
+            .get_empty_pools_from_logs(start_block, None, 1000, middleware.clone())
+            .await?;
+
+        // 更新 checkpoint 数据
+        let mut new_amm_count = 0;
+        for amm in new_amms.into_iter() {
+            // 跳过已经存在于 checkpoint 中的 amm
+            if self.amms.contains_key(&amm.address()) {
+                continue;
+            }
+
+            self.amms.insert(amm.address(), amm);
+            new_amm_count += 1;
+        }
+        self.block_number = Some(end_block);
+        tracing::info!(
+            "更新池子数据. start: {}, end: {}, amms_count: {}",
+            start_block,
+            end_block,
+            new_amm_count
+        );
+
+        Ok(())
+    }
+
+    pub async fn sync_currencies<M: 'static + Middleware>(
+        &mut self,
+        middleware: Arc<M>,
+    ) -> Result<(), AMMError<M>> {
+        let mut missing_currencies = HashSet::new();
+        for (_, amm) in self.amms.iter_mut() {
+            for token in amm.tokens().iter() {
+                match self.currencies.get(token) {
+                    None => {
+                        // 收集缺失的currency
+                        missing_currencies.insert(token.clone());
+                    }
+                    Some(currency) => amm.set_currency(currency.clone()), // 更新amm的currency信息
+                }
+            }
+        }
+
+        let step = 100usize;
+        // 加载缺失的currency信息
+        tracing::info!(
+            "加载缺失的currency信息. 共缺少{}个",
+            missing_currencies.len()
+        );
+        let currencies = batch_get_currency_info(
+            missing_currencies.clone().into_iter().collect(),
+            Some(step),
+            middleware.clone(),
+        )
+            .await?;
+        tracing::info!("加载缺失的currency信息完成. 共加载{}个", currencies.len());
+
+        if currencies.is_empty() {
+            return Ok(());
+        }
+
+        for currency in currencies {
+            if currency.is_invalid_token() {
+                continue;
+            }
+
+            self.currencies.insert(currency.address(), currency);
+        }
+
+        // 当step为1时, 说明是一个一个代币查询, 如果还报错，就是有坑人的交易对，直接将货币拉进黑名单, 并删除amm
+        if step == 1 {
+            for missing_currency in missing_currencies {
+                if !self.currencies.contains_key(&missing_currency) {
+                    self.currencies_blacklist.insert(missing_currency);
+                }
+            }
+
+            // 更新黑名单后, 删除无效的amm
+            self.remove_invalid_amm();
+        }
+
+        // 再次填充amm的currency信息
+        for (_, amm) in self.amms.iter_mut() {
+            for currency in amm.currencies().iter() {
+                if currency.data_is_filled() {
+                    continue;
+                }
+
+                match self.currencies.get(&currency.address()) {
+                    None => continue,
+                    Some(currency) => amm.set_currency(currency.clone()), // 更新amm的currency信息
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Amm同步事件过滤器
+    fn amm_sync_event_filter(&self) -> Filter {
+        let mut event_signatures: Vec<H256> = vec![];
+        let mut amm_variants = HashSet::new();
+
+        for (_, amm) in self.amms.iter() {
+            let variant = match amm {
+                AMM::UniswapV2Pool(_) => 0,
+            };
+
+            if !amm_variants.contains(&variant) {
+                amm_variants.insert(variant);
+                event_signatures.extend(amm.sync_on_event_signatures());
+            }
+        }
+
+        //Create a new filter
+        Filter::new().topic0(event_signatures)
+    }
+
+    /// 同步amms的深度数据
+    pub async fn sync_amms_reserve<M: 'static + Middleware>(
+        &mut self,
+        middleware: Arc<M>,
+    ) -> Result<(), AMMError<M>> {
+        let latest_block = middleware
+            .get_block_number()
+            .await
+            .map_err(AMMError::MiddlewareError)?
+            .as_u64();
+
+        let block_filter = self.amm_sync_event_filter();
+
+        let mut start_block = self.last_synced_log_block() + 1; // +1, 因为当前块已经同步过了, 从下一个块开始查起
+        let step = 200000u64;
+
+        loop {
+            if start_block >= latest_block {
+                break;
+            }
+
+            let target_block = min(start_block + step, latest_block);
+
+            tracing::info!(
+                "Syncing state space from block {} to block {}, latest_block {}",
+                start_block,
+                target_block,
+                latest_block
+            );
+            let logs = batch_request_logs(middleware.clone(), block_filter.clone(), start_block, target_block).await?; // 请求日志
+
+            for log in logs {
+                // 检查是否是状态空间中的amm的日志
+                if let Some(amm) = self.amms.get_mut(&log.address) {
+                    match amm.sync_from_log(log) {
+                        Ok(_) => {}
+                        Err(EventLogError::LogAlreadySynced) => continue,
+                        Err(err) => return Err(AMMError::EventLogError(err)),
+                    }
+                }
+            }
+
+            start_block = target_block + 1;
+        }
+
+        Ok(())
     }
 }
 
-//Get all pairs from last synced block and sync reserve values for each Dex in the `dexes` vec.
-pub async fn sync_amms_from_checkpoint<M: 'static + Middleware>(
-    path_to_checkpoint: &str,
-    step: u64,
+
+async fn batch_request_logs<M: 'static + Middleware>(
     middleware: Arc<M>,
-) -> Result<(Vec<Factory>, Vec<AMM>), AMMError<M>> {
-    let current_block = middleware
-        .get_block_number()
-        .await
-        .map_err(AMMError::MiddlewareError)?
-        .as_u64();
+    filter: Filter,
+    start_block: u64,
+    end_block: u64,
+) -> Result<Vec<Log>, AMMError<M>> {
 
-    let checkpoint: Checkpoint =
-        serde_json::from_str(read_to_string(path_to_checkpoint)?.as_str())?;
+    // 初始化并发任务
+    let mut futures = FuturesUnordered::new();
+    let step = 200;
+    for i in (start_block..=end_block).step_by(step) {
+        let filter = filter.clone().from_block(i).to_block(min(i + step as u64, end_block));
+        let middleware = middleware.clone();
 
-    //Sort all of the pools from the checkpoint into uniswap_v2_pools and uniswap_v3_pools pools so we can sync them concurrently
-    let (uniswap_v2_pools, uniswap_v3_pools, erc_4626_pools) = sort_amms(checkpoint.amms);
-
-    let mut aggregated_amms = vec![];
-    let mut handles = vec![];
-
-    //Sync all uniswap v2 pools from checkpoint
-    if !uniswap_v2_pools.is_empty() {
-        handles.push(
-            batch_sync_amms_from_checkpoint(
-                uniswap_v2_pools,
-                Some(current_block),
-                middleware.clone(),
-            )
-            .await,
-        );
+        futures.push(async move { middleware.get_logs(&filter).await.map_err(AMMError::MiddlewareError) });
     }
 
-    //Sync all uniswap v3 pools from checkpoint
-    if !uniswap_v3_pools.is_empty() {
-        handles.push(
-            batch_sync_amms_from_checkpoint(
-                uniswap_v3_pools,
-                Some(current_block),
-                middleware.clone(),
-            )
-            .await,
-        );
-    }
+    // 并发请求日志
+    let mut logs = HashMap::new();
 
-    if !erc_4626_pools.is_empty() {
-        // TODO: Batch sync erc4626 pools from checkpoint
-        todo!(
-            r#"""This function will produce an incorrect state if ERC4626 pools are present in the checkpoint. 
-            This logic needs to be implemented into batch_sync_amms_from_checkpoint"""#
-        );
-    }
-
-    //Sync all pools from the since synced block
-    handles.extend(
-        get_new_amms_from_range(
-            checkpoint.factories.clone(),
-            checkpoint.block_number,
-            current_block,
-            step,
-            middleware.clone(),
-        )
-        .await,
-    );
-
-    for handle in handles {
-        match handle.await {
-            Ok(sync_result) => aggregated_amms.extend(sync_result?),
-            Err(err) => {
-                {
-                    if err.is_panic() {
-                        // Resume the panic on the main task
-                        resume_unwind(err.into_panic());
+    while let Some(result) = futures.next().await {
+        for log in result? {
+            match logs.get(&log.address) {
+                None => {
+                    logs.insert(log.address, log);
+                }
+                Some(old) => {
+                    let new_log_index = (log.block_number.unwrap().as_u64(), log.log_index.unwrap().as_u64());
+                    let old_log_index = (old.block_number.unwrap().as_u64(), old.log_index.unwrap().as_u64());
+                    if new_log_index > old_log_index {
+                        logs.insert(log.address, log);
                     }
                 }
             }
         }
     }
 
-    //update the sync checkpoint
-    construct_checkpoint(
-        checkpoint.factories.clone(),
-        &aggregated_amms,
-        current_block,
-        path_to_checkpoint,
-    )?;
-
-    Ok((checkpoint.factories, aggregated_amms))
+    Ok(logs.into_iter().map(|(_, log)| log).collect())
 }
 
-pub async fn get_new_amms_from_range<M: 'static + Middleware>(
-    factories: Vec<Factory>,
-    from_block: u64,
-    to_block: u64,
-    step: u64,
-    middleware: Arc<M>,
-) -> Vec<JoinHandle<Result<Vec<AMM>, AMMError<M>>>> {
-    //Create the filter with all the pair created events
-    //Aggregate the populated pools from each thread
-    let mut handles = vec![];
-
-    for factory in factories.into_iter() {
-        let middleware = middleware.clone();
-
-        //Spawn a new thread to get all pools and sync data for each dex
-        handles.push(tokio::spawn(async move {
-            let mut amms = factory
-                .get_all_pools_from_logs(from_block, to_block, step, middleware.clone())
-                .await?;
-
-            factory
-                .populate_amm_data(&mut amms, Some(to_block), middleware.clone())
-                .await?;
-
-            //Clean empty pools
-            amms = filters::filter_empty_amms(amms);
-
-            Ok::<_, AMMError<M>>(amms)
-        }));
-    }
-
-    handles
-}
-
-pub async fn batch_sync_amms_from_checkpoint<M: 'static + Middleware>(
-    mut amms: Vec<AMM>,
-    block_number: Option<u64>,
-    middleware: Arc<M>,
-) -> JoinHandle<Result<Vec<AMM>, AMMError<M>>> {
-    let factory = match amms[0] {
-        AMM::UniswapV2Pool(_) => Some(Factory::UniswapV2Factory(UniswapV2Factory::new(
-            H160::zero(),
-            0,
-            0,
-        ))),
-
-        AMM::UniswapV3Pool(_) => Some(Factory::UniswapV3Factory(UniswapV3Factory::new(
-            H160::zero(),
-            0,
-        ))),
-
-        AMM::ERC4626Vault(_) => None,
-    };
-
-    //Spawn a new thread to get all pools and sync data for each dex
-    tokio::spawn(async move {
-        if let Some(factory) = factory {
-            if amms_are_congruent(&amms) {
-                //Get all pool data via batched calls
-                factory
-                    .populate_amm_data(&mut amms, block_number, middleware)
-                    .await?;
-
-                //Clean empty pools
-                amms = filters::filter_empty_amms(amms);
-
-                Ok::<_, AMMError<M>>(amms)
-            } else {
-                Err(AMMError::IncongruentAMMs)
-            }
-        } else {
-            Ok::<_, AMMError<M>>(vec![])
-        }
-    })
-}
-
-pub fn sort_amms(amms: Vec<AMM>) -> (Vec<AMM>, Vec<AMM>, Vec<AMM>) {
-    let mut uniswap_v2_pools = vec![];
-    let mut uniswap_v3_pools = vec![];
-    let mut erc_4626_vaults = vec![];
-    for amm in amms {
-        match amm {
-            AMM::UniswapV2Pool(_) => uniswap_v2_pools.push(amm),
-            AMM::UniswapV3Pool(_) => uniswap_v3_pools.push(amm),
-            AMM::ERC4626Vault(_) => erc_4626_vaults.push(amm),
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_checkpoint() {
+        for i in (0..=1000).step_by(200) {
+            println!("{}, {}", i, i + 200)
         }
     }
-
-    (uniswap_v2_pools, uniswap_v3_pools, erc_4626_vaults)
-}
-
-pub async fn get_new_pools_from_range<M: 'static + Middleware>(
-    factories: Vec<Factory>,
-    from_block: u64,
-    to_block: u64,
-    step: u64,
-    middleware: Arc<M>,
-) -> Vec<JoinHandle<Result<Vec<AMM>, AMMError<M>>>> {
-    //Create the filter with all the pair created events
-    //Aggregate the populated pools from each thread
-    let mut handles = vec![];
-
-    for factory in factories {
-        let middleware = middleware.clone();
-
-        //Spawn a new thread to get all pools and sync data for each dex
-        handles.push(tokio::spawn(async move {
-            let mut pools = factory
-                .get_all_pools_from_logs(from_block, to_block, step, middleware.clone())
-                .await?;
-
-            factory
-                .populate_amm_data(&mut pools, Some(to_block), middleware.clone())
-                .await?;
-
-            //Clean empty pools
-            pools = filters::filter_empty_amms(pools);
-
-            Ok::<_, AMMError<M>>(pools)
-        }));
-    }
-
-    handles
-}
-
-pub fn construct_checkpoint(
-    factories: Vec<Factory>,
-    amms: &[AMM],
-    latest_block: u64,
-    checkpoint_path: &str,
-) -> Result<(), CheckpointError> {
-    let checkpoint = Checkpoint::new(
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64() as usize,
-        latest_block,
-        factories,
-        amms.to_vec(),
-    );
-
-    std::fs::write(checkpoint_path, serde_json::to_string_pretty(&checkpoint)?)?;
-
-    Ok(())
-}
-
-//Deconstructs the checkpoint into a Vec<AMM>
-pub fn deconstruct_checkpoint(checkpoint_path: &str) -> Result<(Vec<AMM>, u64), CheckpointError> {
-    let checkpoint: Checkpoint = serde_json::from_str(read_to_string(checkpoint_path)?.as_str())?;
-    Ok((checkpoint.amms, checkpoint.block_number))
 }

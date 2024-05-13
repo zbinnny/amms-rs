@@ -21,6 +21,7 @@ use crate::{
     amm::AutomatedMarketMaker,
     errors::{AMMError, ArithmeticError, EventLogError, SwapSimulationError},
 };
+use crate::currency::Currency;
 
 use self::factory::POOL_CREATED_EVENT_SIGNATURE;
 
@@ -87,10 +88,8 @@ pub const Q224: U256 = U256([0, 0, 0, 4294967296]);
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UniswapV3Pool {
     pub address: H160,
-    pub token_a: H160,
-    pub token_a_decimals: u8,
-    pub token_b: H160,
-    pub token_b_decimals: u8,
+    pub token_a: Currency,
+    pub token_b: Currency,
     pub liquidity: u128,
     pub sqrt_price: U256,
     pub fee: u32,
@@ -99,7 +98,7 @@ pub struct UniswapV3Pool {
     pub tick_bitmap: HashMap<i16, U256>,
     pub ticks: HashMap<i32, Info>,
     #[serde(default)]
-    pub last_synced: (u64, u64),
+    pub last_synced_log: (u64, u64),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -126,11 +125,15 @@ impl AutomatedMarketMaker for UniswapV3Pool {
     }
 
     fn tokens(&self) -> Vec<H160> {
-        vec![self.token_a, self.token_b]
+        vec![self.token_a.address(), self.token_b.address()]
+    }
+
+    fn currencies(&self) -> Vec<Currency> {
+        return vec![self.token_a.clone(), self.token_b.clone()];
     }
 
     fn last_synced_log(&self) -> (u64, u64) {
-        self.last_synced
+        self.last_synced_log
     }
 
     //This defines the event signatures to listen to that will produce events to be passed into AMM::sync_from_log()
@@ -156,7 +159,7 @@ impl AutomatedMarketMaker for UniswapV3Pool {
         let log_index = log.log_index.clone().ok_or(EventLogError::LogIndexNotFound)?.as_u64();
 
         // 判断是否是已经同步过的日志
-        if (block_number, log_index) <= self.last_synced {
+        if (block_number, log_index) <= self.last_synced_log {
             return Err(EventLogError::LogAlreadySynced);
         }
 
@@ -170,25 +173,14 @@ impl AutomatedMarketMaker for UniswapV3Pool {
             Err(EventLogError::InvalidEventSignature)?
         }
 
-        self.last_synced = (block_number, log_index);
+        self.last_synced_log = (block_number, log_index);
 
-        Ok(())
-    }
-
-    // NOTE: This function will not populate the tick_bitmap and ticks, if you want to populate those, you must call populate_tick_data on an initialized pool
-    async fn populate_data<M: Middleware>(
-        &mut self,
-        block_number: Option<u64>,
-        middleware: Arc<M>,
-    ) -> Result<(), AMMError<M>> {
-        batch_request::get_v3_pool_data_batch_request(self, block_number, middleware.clone())
-            .await?;
         Ok(())
     }
 
     fn calculate_price(&self, base_token: H160) -> Result<f64, ArithmeticError> {
         let tick = uniswap_v3_math::tick_math::get_tick_at_sqrt_ratio(self.sqrt_price)?;
-        let shift = self.token_a_decimals as i8 - self.token_b_decimals as i8;
+        let shift = self.token_a.decimals() as i8 - self.token_b.decimals() as i8;
 
         let price = match shift.cmp(&0) {
             Ordering::Less => 1.0001_f64.powi(tick) / 10_f64.powi(-shift as i32),
@@ -196,7 +188,7 @@ impl AutomatedMarketMaker for UniswapV3Pool {
             Ordering::Equal => 1.0001_f64.powi(tick),
         };
 
-        if base_token == self.token_a {
+        if base_token == self.token_a.address() {
             Ok(price)
         } else {
             Ok(1.0 / price)
@@ -204,10 +196,12 @@ impl AutomatedMarketMaker for UniswapV3Pool {
     }
 
     fn get_token_out(&self, token_in: H160) -> H160 {
-        if self.token_a == token_in {
-            self.token_b
+        let token_a = self.token_a.address();
+        let token_b = self.token_b.address();
+        if token_a == token_in {
+            token_b
         } else {
-            self.token_a
+            token_a
         }
     }
 
@@ -216,7 +210,7 @@ impl AutomatedMarketMaker for UniswapV3Pool {
             return Ok(U256::zero());
         }
 
-        let zero_for_one = token_in == self.token_a;
+        let zero_for_one = token_in == self.token_a.address();
 
         //Set sqrt_price_limit_x_96 to the max or min sqrt price in the pool depending on zero_for_one
         let sqrt_price_limit_x_96 = if zero_for_one {
@@ -348,7 +342,7 @@ impl AutomatedMarketMaker for UniswapV3Pool {
             return Ok(U256::zero());
         }
 
-        let zero_for_one = token_in == self.token_a;
+        let zero_for_one = token_in == self.token_a.address();
 
         //Set sqrt_price_limit_x_96 to the max or min sqrt price in the pool depending on zero_for_one
         let sqrt_price_limit_x_96 = if zero_for_one {
@@ -485,10 +479,8 @@ impl UniswapV3Pool {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         address: H160,
-        token_a: H160,
-        token_a_decimals: u8,
-        token_b: H160,
-        token_b_decimals: u8,
+        token_a: Currency,
+        token_b: Currency,
         fee: u32,
         liquidity: u128,
         sqrt_price: U256,
@@ -496,14 +488,12 @@ impl UniswapV3Pool {
         tick_spacing: i32,
         tick_bitmap: HashMap<i16, U256>,
         ticks: HashMap<i32, Info>,
-        last_synced: (u64, u64),
+        last_synced_log: (u64, u64),
     ) -> UniswapV3Pool {
         UniswapV3Pool {
             address,
             token_a,
-            token_a_decimals,
             token_b,
-            token_b_decimals,
             fee,
             liquidity,
             sqrt_price,
@@ -511,7 +501,7 @@ impl UniswapV3Pool {
             tick_spacing,
             tick_bitmap,
             ticks,
-            last_synced,
+            last_synced_log,
         }
     }
 
@@ -535,12 +525,12 @@ impl UniswapV3Pool {
             .populate_tick_data(creation_block, middleware.clone())
             .await?;
 
-        //TODO: break this into two threads so it can happen concurrently
-        pool.populate_data(Some(synced_block), middleware).await?;
-
-        if !pool.data_is_populated() {
-            return Err(AMMError::PoolDataError);
-        }
+        // //TODO: break this into two threads so it can happen concurrently
+        // pool.populate_data(Some(synced_block), middleware).await?;
+        //
+        // if !pool.data_is_populated() {
+        //     return Err(AMMError::PoolDataError);
+        // }
 
         Ok(pool)
     }
@@ -578,13 +568,18 @@ impl UniswapV3Pool {
         let event_signature = log.topics[0];
 
         if event_signature == POOL_CREATED_EVENT_SIGNATURE {
+            let log_index = (
+                log.block_number.ok_or(EventLogError::LogBlockNumberNotFound)?.as_u64(),
+                log.log_index.ok_or(EventLogError::LogIndexNotFound)?.as_u64(),
+            );
             let pool_created_event = PoolCreatedFilter::decode_log(&RawLog::from(log))?;
 
             Ok(UniswapV3Pool {
                 address: pool_created_event.pool,
-                token_a: pool_created_event.token_0,
-                token_b: pool_created_event.token_1,
+                token_a: pool_created_event.token_0.into(),
+                token_b: pool_created_event.token_1.into(),
                 fee: pool_created_event.fee,
+                last_synced_log: log_index,
                 ..Default::default()
             })
         } else {
@@ -910,23 +905,6 @@ impl UniswapV3Pool {
         Ok(())
     }
 
-    pub async fn get_token_decimals<M: Middleware>(
-        &mut self,
-        middleware: Arc<M>,
-    ) -> Result<(u8, u8), AMMError<M>> {
-        let token_a_decimals = IErc20::new(self.token_a, middleware.clone())
-            .decimals()
-            .call()
-            .await?;
-
-        let token_b_decimals = IErc20::new(self.token_b, middleware)
-            .decimals()
-            .call()
-            .await?;
-
-        Ok((token_a_decimals, token_b_decimals))
-    }
-
     pub async fn get_fee<M: Middleware>(&mut self, middleware: Arc<M>) -> Result<u32, AMMError<M>> {
         let fee = IUniswapV3Pool::new(self.address, middleware)
             .fee()
@@ -1066,877 +1044,877 @@ pub struct Tick {
     pub initialized: bool,
 }
 
-#[cfg(test)]
-mod test {
-    #[allow(unused)]
-    use std::{str::FromStr, sync::Arc};
-    #[allow(unused)]
-    use std::error::Error;
-
-    #[allow(unused)]
-    use ethers::{
-        prelude::abigen,
-        providers::{Http, Provider},
-        types::{H160, U256},
-    };
-    #[allow(unused)]
-    use ethers::providers::Middleware;
-
-    use crate::amm::AutomatedMarketMaker;
-
-    use super::IUniswapV3Pool;
-    #[allow(unused)]
-    #[allow(unused)]
-    use super::UniswapV3Pool;
-
-    abigen!(
-        IQuoter,
-    r#"[
-        function quoteExactInputSingle(address tokenIn, address tokenOut,uint24 fee, uint256 amountIn, uint160 sqrtPriceLimitX96) external returns (uint256 amountOut)
-    ]"#;);
-
-    async fn initialize_usdc_weth_pool<M: 'static + Middleware>(
-        middleware: Arc<M>,
-    ) -> eyre::Result<(UniswapV3Pool, u64)> {
-        let mut pool = UniswapV3Pool {
-            address: H160::from_str("0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640")?,
-            ..Default::default()
-        };
-
-        let creation_block = 12369620;
-        pool.tick_spacing = pool.get_tick_spacing(middleware.clone()).await?;
-        let synced_block = pool
-            .populate_tick_data(creation_block, middleware.clone())
-            .await?;
-        pool.populate_data(Some(synced_block), middleware).await?;
-
-        Ok((pool, synced_block))
-    }
-
-    async fn initialize_weth_link_pool<M: 'static + Middleware>(
-        middleware: Arc<M>,
-    ) -> eyre::Result<(UniswapV3Pool, u64)> {
-        let mut pool = UniswapV3Pool {
-            address: H160::from_str("0xa6Cc3C2531FdaA6Ae1A3CA84c2855806728693e8")?,
-            ..Default::default()
-        };
-
-        let creation_block = 12375680;
-        pool.tick_spacing = pool.get_tick_spacing(middleware.clone()).await?;
-        let synced_block = pool
-            .populate_tick_data(creation_block, middleware.clone())
-            .await?;
-        pool.populate_data(Some(synced_block), middleware).await?;
-
-        Ok((pool, synced_block))
-    }
-
-    #[tokio::test]
-    #[ignore] //Ignoring to not throttle the Provider on workflows
-    async fn test_simulate_swap_usdc_weth() -> eyre::Result<()> {
-        let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
-        let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
-
-        let (pool, synced_block) = initialize_usdc_weth_pool(middleware.clone()).await?;
-        let quoter = IQuoter::new(
-            H160::from_str("0xb27308f9f90d607463bb33ea1bebb41c27ce5ab6")?,
-            middleware.clone(),
-        );
-        let amount_in = U256::from_dec_str("100000000")?; // 100 USDC
-
-        let amount_out = pool.simulate_swap(pool.token_a, amount_in)?;
-        let expected_amount_out = quoter
-            .quote_exact_input_single(
-                pool.token_a,
-                pool.token_b,
-                pool.fee,
-                amount_in,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-        assert_eq!(amount_out, expected_amount_out);
-        let amount_in_1 = U256::from_dec_str("10000000000")?; // 10_000 USDC
-
-        let amount_out_1 = pool.simulate_swap(pool.token_a, amount_in_1)?;
-
-        let expected_amount_out_1 = quoter
-            .quote_exact_input_single(
-                pool.token_a,
-                pool.token_b,
-                pool.fee,
-                amount_in_1,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_1, expected_amount_out_1);
-
-        let amount_in_2 = U256::from_dec_str("10000000000000")?; // 10_000_000 USDC
-
-        let amount_out_2 = pool.simulate_swap(pool.token_a, amount_in_2)?;
-
-        let expected_amount_out_2 = quoter
-            .quote_exact_input_single(
-                pool.token_a,
-                pool.token_b,
-                pool.fee,
-                amount_in_2,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_2, expected_amount_out_2);
-
-        let amount_in_3 = U256::from_dec_str("100000000000000")?; // 100_000_000 USDC
-
-        let amount_out_3 = pool.simulate_swap(pool.token_a, amount_in_3)?;
-
-        let expected_amount_out_3 = quoter
-            .quote_exact_input_single(
-                pool.token_a,
-                pool.token_b,
-                pool.fee,
-                amount_in_3,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_3, expected_amount_out_3);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore] //Ignoring to not throttle the Provider on workflows
-    async fn test_simulate_swap_weth_usdc() -> eyre::Result<()> {
-        let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
-        let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
-
-        let (pool, synced_block) = initialize_usdc_weth_pool(middleware.clone()).await?;
-        let quoter = IQuoter::new(
-            H160::from_str("0xb27308f9f90d607463bb33ea1bebb41c27ce5ab6")?,
-            middleware.clone(),
-        );
-
-        let amount_in = U256::from_dec_str("1000000000000000000")?; // 1 ETH
-
-        let amount_out = pool.simulate_swap(pool.token_b, amount_in)?;
-        let expected_amount_out = quoter
-            .quote_exact_input_single(
-                pool.token_b,
-                pool.token_a,
-                pool.fee,
-                amount_in,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-        assert_eq!(amount_out, expected_amount_out);
-        let amount_in_1 = U256::from_dec_str("10000000000000000000")?; // 10 ETH
-
-        let amount_out_1 = pool.simulate_swap(pool.token_b, amount_in_1)?;
-
-        let expected_amount_out_1 = quoter
-            .quote_exact_input_single(
-                pool.token_b,
-                pool.token_a,
-                pool.fee,
-                amount_in_1,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_1, expected_amount_out_1);
-
-        let amount_in_2 = U256::from_dec_str("100000000000000000000")?; // 100 ETH
-
-        let amount_out_2 = pool.simulate_swap(pool.token_b, amount_in_2)?;
-
-        let expected_amount_out_2 = quoter
-            .quote_exact_input_single(
-                pool.token_b,
-                pool.token_a,
-                pool.fee,
-                amount_in_2,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_2, expected_amount_out_2);
-
-        let amount_in_3 = U256::from_dec_str("100000000000000000000")?; // 100_000 ETH
-
-        let amount_out_3 = pool.simulate_swap(pool.token_b, amount_in_3)?;
-
-        let expected_amount_out_3 = quoter
-            .quote_exact_input_single(
-                pool.token_b,
-                pool.token_a,
-                pool.fee,
-                amount_in_3,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_3, expected_amount_out_3);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore] //Ignoring to not throttle the Provider on workflows
-    async fn test_simulate_swap_link_weth() -> eyre::Result<()> {
-        let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
-        let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
-
-        let (pool, synced_block) = initialize_weth_link_pool(middleware.clone()).await?;
-        let quoter = IQuoter::new(
-            H160::from_str("0xb27308f9f90d607463bb33ea1bebb41c27ce5ab6")?,
-            middleware.clone(),
-        );
-
-        let amount_in = U256::from_dec_str("1000000000000000000")?; // 1 LINK
-
-        let amount_out = pool.simulate_swap(pool.token_a, amount_in)?;
-        let expected_amount_out = quoter
-            .quote_exact_input_single(
-                pool.token_a,
-                pool.token_b,
-                pool.fee,
-                amount_in,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-        assert_eq!(amount_out, expected_amount_out);
-        let amount_in_1 = U256::from_dec_str("100000000000000000000")?; // 100 LINK
-
-        let amount_out_1 = pool.simulate_swap(pool.token_a, amount_in_1)?;
-
-        let expected_amount_out_1 = quoter
-            .quote_exact_input_single(
-                pool.token_a,
-                pool.token_b,
-                pool.fee,
-                amount_in_1,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_1, expected_amount_out_1);
-
-        let amount_in_2 = U256::from_dec_str("10000000000000000000000")?; // 10_000 LINK
-
-        let amount_out_2 = pool.simulate_swap(pool.token_a, amount_in_2)?;
-
-        let expected_amount_out_2 = quoter
-            .quote_exact_input_single(
-                pool.token_a,
-                pool.token_b,
-                pool.fee,
-                amount_in_2,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_2, expected_amount_out_2);
-
-        let amount_in_3 = U256::from_dec_str("10000000000000000000000")?; // 1_000_000 LINK
-
-        let amount_out_3 = pool.simulate_swap(pool.token_a, amount_in_3)?;
-
-        let expected_amount_out_3 = quoter
-            .quote_exact_input_single(
-                pool.token_a,
-                pool.token_b,
-                pool.fee,
-                amount_in_3,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_3, expected_amount_out_3);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore] //Ignoring to not throttle the Provider on workflows
-    async fn test_simulate_swap_weth_link() -> eyre::Result<()> {
-        let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
-        let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
-
-        let (pool, synced_block) = initialize_weth_link_pool(middleware.clone()).await?;
-        let quoter = IQuoter::new(
-            H160::from_str("0xb27308f9f90d607463bb33ea1bebb41c27ce5ab6")?,
-            middleware.clone(),
-        );
-
-        let amount_in = U256::from_dec_str("1000000000000000000")?; // 1 ETH
-
-        let amount_out = pool.simulate_swap(pool.token_b, amount_in)?;
-        let expected_amount_out = quoter
-            .quote_exact_input_single(
-                pool.token_b,
-                pool.token_a,
-                pool.fee,
-                amount_in,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-        assert_eq!(amount_out, expected_amount_out);
-        let amount_in_1 = U256::from_dec_str("10000000000000000000")?; // 10 ETH
-
-        let amount_out_1 = pool.simulate_swap(pool.token_b, amount_in_1)?;
-
-        let expected_amount_out_1 = quoter
-            .quote_exact_input_single(
-                pool.token_b,
-                pool.token_a,
-                pool.fee,
-                amount_in_1,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_1, expected_amount_out_1);
-
-        let amount_in_2 = U256::from_dec_str("100000000000000000000")?; // 100 ETH
-
-        let amount_out_2 = pool.simulate_swap(pool.token_b, amount_in_2)?;
-
-        let expected_amount_out_2 = quoter
-            .quote_exact_input_single(
-                pool.token_b,
-                pool.token_a,
-                pool.fee,
-                amount_in_2,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_2, expected_amount_out_2);
-
-        let amount_in_3 = U256::from_dec_str("100000000000000000000")?; // 100_000 ETH
-
-        let amount_out_3 = pool.simulate_swap(pool.token_b, amount_in_3)?;
-
-        let expected_amount_out_3 = quoter
-            .quote_exact_input_single(
-                pool.token_b,
-                pool.token_a,
-                pool.fee,
-                amount_in_3,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_3, expected_amount_out_3);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore] //Ignoring to not throttle the Provider on workflows
-    async fn test_simulate_swap_mut_usdc_weth() -> eyre::Result<()> {
-        let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
-        let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
-
-        let (pool, synced_block) = initialize_usdc_weth_pool(middleware.clone()).await?;
-        let quoter = IQuoter::new(
-            H160::from_str("0xb27308f9f90d607463bb33ea1bebb41c27ce5ab6")?,
-            middleware.clone(),
-        );
-        let amount_in = U256::from_dec_str("100000000")?; // 100 USDC
-
-        let amount_out = pool.simulate_swap(pool.token_a, amount_in)?;
-        let expected_amount_out = quoter
-            .quote_exact_input_single(
-                pool.token_a,
-                pool.token_b,
-                pool.fee,
-                amount_in,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-        assert_eq!(amount_out, expected_amount_out);
-        let amount_in_1 = U256::from_dec_str("10000000000")?; // 10_000 USDC
-
-        let amount_out_1 = pool.simulate_swap(pool.token_a, amount_in_1)?;
-
-        let expected_amount_out_1 = quoter
-            .quote_exact_input_single(
-                pool.token_a,
-                pool.token_b,
-                pool.fee,
-                amount_in_1,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_1, expected_amount_out_1);
-
-        let amount_in_2 = U256::from_dec_str("10000000000000")?; // 10_000_000 USDC
-
-        let amount_out_2 = pool.simulate_swap(pool.token_a, amount_in_2)?;
-
-        let expected_amount_out_2 = quoter
-            .quote_exact_input_single(
-                pool.token_a,
-                pool.token_b,
-                pool.fee,
-                amount_in_2,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_2, expected_amount_out_2);
-
-        let amount_in_3 = U256::from_dec_str("100000000000000")?; // 100_000_000 USDC
-
-        let amount_out_3 = pool.simulate_swap(pool.token_a, amount_in_3)?;
-
-        let expected_amount_out_3 = quoter
-            .quote_exact_input_single(
-                pool.token_a,
-                pool.token_b,
-                pool.fee,
-                amount_in_3,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_3, expected_amount_out_3);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore] //Ignoring to not throttle the Provider on workflows
-    async fn test_simulate_swap_mut_weth_usdc() -> eyre::Result<()> {
-        let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
-        let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
-
-        let (pool, synced_block) = initialize_usdc_weth_pool(middleware.clone()).await?;
-        let quoter = IQuoter::new(
-            H160::from_str("0xb27308f9f90d607463bb33ea1bebb41c27ce5ab6")?,
-            middleware.clone(),
-        );
-
-        let amount_in = U256::from_dec_str("1000000000000000000")?; // 1 ETH
-
-        let amount_out = pool.simulate_swap(pool.token_b, amount_in)?;
-        let expected_amount_out = quoter
-            .quote_exact_input_single(
-                pool.token_b,
-                pool.token_a,
-                pool.fee,
-                amount_in,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-        assert_eq!(amount_out, expected_amount_out);
-        let amount_in_1 = U256::from_dec_str("10000000000000000000")?; // 10 ETH
-
-        let amount_out_1 = pool.simulate_swap(pool.token_b, amount_in_1)?;
-
-        let expected_amount_out_1 = quoter
-            .quote_exact_input_single(
-                pool.token_b,
-                pool.token_a,
-                pool.fee,
-                amount_in_1,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_1, expected_amount_out_1);
-
-        let amount_in_2 = U256::from_dec_str("100000000000000000000")?; // 100 ETH
-
-        let amount_out_2 = pool.simulate_swap(pool.token_b, amount_in_2)?;
-
-        let expected_amount_out_2 = quoter
-            .quote_exact_input_single(
-                pool.token_b,
-                pool.token_a,
-                pool.fee,
-                amount_in_2,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_2, expected_amount_out_2);
-
-        let amount_in_3 = U256::from_dec_str("100000000000000000000")?; // 100_000 ETH
-
-        let amount_out_3 = pool.simulate_swap(pool.token_b, amount_in_3)?;
-
-        let expected_amount_out_3 = quoter
-            .quote_exact_input_single(
-                pool.token_b,
-                pool.token_a,
-                pool.fee,
-                amount_in_3,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_3, expected_amount_out_3);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore] //Ignoring to not throttle the Provider on workflows
-    async fn test_simulate_swap_mut_link_weth() -> eyre::Result<()> {
-        let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
-        let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
-
-        let (pool, synced_block) = initialize_weth_link_pool(middleware.clone()).await?;
-        let quoter = IQuoter::new(
-            H160::from_str("0xb27308f9f90d607463bb33ea1bebb41c27ce5ab6")?,
-            middleware.clone(),
-        );
-
-        let amount_in = U256::from_dec_str("1000000000000000000")?; // 1 LINK
-
-        let amount_out = pool.simulate_swap(pool.token_a, amount_in)?;
-        let expected_amount_out = quoter
-            .quote_exact_input_single(
-                pool.token_a,
-                pool.token_b,
-                pool.fee,
-                amount_in,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-        assert_eq!(amount_out, expected_amount_out);
-        let amount_in_1 = U256::from_dec_str("100000000000000000000")?; // 100 LINK
-
-        let amount_out_1 = pool.simulate_swap(pool.token_a, amount_in_1)?;
-
-        let expected_amount_out_1 = quoter
-            .quote_exact_input_single(
-                pool.token_a,
-                pool.token_b,
-                pool.fee,
-                amount_in_1,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_1, expected_amount_out_1);
-
-        let amount_in_2 = U256::from_dec_str("10000000000000000000000")?; // 10_000 LINK
-
-        let amount_out_2 = pool.simulate_swap(pool.token_a, amount_in_2)?;
-
-        let expected_amount_out_2 = quoter
-            .quote_exact_input_single(
-                pool.token_a,
-                pool.token_b,
-                pool.fee,
-                amount_in_2,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_2, expected_amount_out_2);
-
-        let amount_in_3 = U256::from_dec_str("10000000000000000000000")?; // 1_000_000 LINK
-
-        let amount_out_3 = pool.simulate_swap(pool.token_a, amount_in_3)?;
-
-        let expected_amount_out_3 = quoter
-            .quote_exact_input_single(
-                pool.token_a,
-                pool.token_b,
-                pool.fee,
-                amount_in_3,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_3, expected_amount_out_3);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore] //Ignoring to not throttle the Provider on workflows
-    async fn test_simulate_swap_mut_weth_link() -> eyre::Result<()> {
-        let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
-        let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
-
-        let (pool, synced_block) = initialize_weth_link_pool(middleware.clone()).await?;
-        let quoter = IQuoter::new(
-            H160::from_str("0xb27308f9f90d607463bb33ea1bebb41c27ce5ab6")?,
-            middleware.clone(),
-        );
-
-        let amount_in = U256::from_dec_str("1000000000000000000")?; // 1 ETH
-
-        let amount_out = pool.simulate_swap(pool.token_b, amount_in)?;
-        let expected_amount_out = quoter
-            .quote_exact_input_single(
-                pool.token_b,
-                pool.token_a,
-                pool.fee,
-                amount_in,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-        assert_eq!(amount_out, expected_amount_out);
-        let amount_in_1 = U256::from_dec_str("10000000000000000000")?; // 10 ETH
-
-        let amount_out_1 = pool.simulate_swap(pool.token_b, amount_in_1)?;
-
-        let expected_amount_out_1 = quoter
-            .quote_exact_input_single(
-                pool.token_b,
-                pool.token_a,
-                pool.fee,
-                amount_in_1,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_1, expected_amount_out_1);
-
-        let amount_in_2 = U256::from_dec_str("100000000000000000000")?; // 100 ETH
-
-        let amount_out_2 = pool.simulate_swap(pool.token_b, amount_in_2)?;
-
-        let expected_amount_out_2 = quoter
-            .quote_exact_input_single(
-                pool.token_b,
-                pool.token_a,
-                pool.fee,
-                amount_in_2,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_2, expected_amount_out_2);
-
-        let amount_in_3 = U256::from_dec_str("100000000000000000000")?; // 100_000 ETH
-
-        let amount_out_3 = pool.simulate_swap(pool.token_b, amount_in_3)?;
-
-        let expected_amount_out_3 = quoter
-            .quote_exact_input_single(
-                pool.token_b,
-                pool.token_a,
-                pool.fee,
-                amount_in_3,
-                U256::zero(),
-            )
-            .block(synced_block)
-            .call()
-            .await?;
-
-        assert_eq!(amount_out_3, expected_amount_out_3);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore] //Ignoring to not throttle the Provider on workflows
-    async fn test_get_new_from_address() -> eyre::Result<()> {
-        let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
-        let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
-
-        let pool = UniswapV3Pool::new_from_address(
-            H160::from_str("0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640")?,
-            12369620,
-            middleware.clone(),
-        )
-            .await?;
-
-        assert_eq!(
-            pool.address,
-            H160::from_str("0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640")?
-        );
-        assert_eq!(
-            pool.token_a,
-            H160::from_str("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")?
-        );
-        assert_eq!(pool.token_a_decimals, 6);
-        assert_eq!(
-            pool.token_b,
-            H160::from_str("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")?
-        );
-        assert_eq!(pool.token_b_decimals, 18);
-        assert_eq!(pool.fee, 500);
-        assert!(pool.tick != 0);
-        assert_eq!(pool.tick_spacing, 10);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore] //Ignoring to not throttle the Provider on workflows
-    async fn test_get_pool_data() -> eyre::Result<()> {
-        let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
-        let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
-
-        let (pool, _synced_block) = initialize_usdc_weth_pool(middleware.clone()).await?;
-        assert_eq!(
-            pool.address,
-            H160::from_str("0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640")?
-        );
-        assert_eq!(
-            pool.token_a,
-            H160::from_str("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")?
-        );
-        assert_eq!(pool.token_a_decimals, 6);
-        assert_eq!(
-            pool.token_b,
-            H160::from_str("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")?
-        );
-        assert_eq!(pool.token_b_decimals, 18);
-        assert_eq!(pool.fee, 500);
-        assert!(pool.tick != 0);
-        assert_eq!(pool.tick_spacing, 10);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_sync_pool() -> eyre::Result<()> {
-        let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
-        let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
-
-        let mut pool = UniswapV3Pool {
-            address: H160::from_str("0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640")?,
-            ..Default::default()
-        };
-
-        pool.sync(middleware).await?;
-
-        //TODO: need to assert values
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_calculate_virtual_reserves() -> eyre::Result<()> {
-        let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
-        let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
-
-        let mut pool = UniswapV3Pool {
-            address: H160::from_str("0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640")?,
-            ..Default::default()
-        };
-
-        pool.populate_data(None, middleware.clone()).await?;
-
-        let pool_at_block = IUniswapV3Pool::new(
-            H160::from_str("0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640")?,
-            middleware.clone(),
-        );
-
-        let sqrt_price = pool_at_block.slot_0().block(16515398).call().await?.0;
-        let liquidity = pool_at_block.liquidity().block(16515398).call().await?;
-
-        pool.sqrt_price = sqrt_price;
-        pool.liquidity = liquidity;
-
-        let (r_0, r_1) = pool.calculate_virtual_reserves()?;
-
-        assert_eq!(1067543429906214, r_0);
-        assert_eq!(649198362624067343572319, r_1);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_calculate_price() -> eyre::Result<()> {
-        let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
-        let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
-
-        let mut pool = UniswapV3Pool {
-            address: H160::from_str("0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640")?,
-            ..Default::default()
-        };
-
-        pool.populate_data(None, middleware.clone()).await?;
-
-        let block_pool = IUniswapV3Pool::new(
-            H160::from_str("0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640")?,
-            middleware.clone(),
-        );
-
-        let sqrt_price = block_pool.slot_0().block(16515398).call().await?.0;
-        pool.sqrt_price = sqrt_price;
-
-        let float_price_a = pool.calculate_price(pool.token_a)?;
-        let float_price_b = pool.calculate_price(pool.token_b)?;
-
-        assert_eq!(float_price_a, 0.0006081236083117488);
-        assert_eq!(float_price_b, 1644.4025299004006);
-
-        Ok(())
-    }
-}
+// #[cfg(test)]
+// mod test {
+//     #[allow(unused)]
+//     use std::{str::FromStr, sync::Arc};
+//     #[allow(unused)]
+//     use std::error::Error;
+//
+//     #[allow(unused)]
+//     use ethers::{
+//         prelude::abigen,
+//         providers::{Http, Provider},
+//         types::{H160, U256},
+//     };
+//     #[allow(unused)]
+//     use ethers::providers::Middleware;
+//
+//     use crate::amm::AutomatedMarketMaker;
+//
+//     use super::IUniswapV3Pool;
+//     #[allow(unused)]
+//     #[allow(unused)]
+//     use super::UniswapV3Pool;
+//
+//     abigen!(
+//         IQuoter,
+//     r#"[
+//         function quoteExactInputSingle(address tokenIn, address tokenOut,uint24 fee, uint256 amountIn, uint160 sqrtPriceLimitX96) external returns (uint256 amountOut)
+//     ]"#;);
+//
+//     async fn initialize_usdc_weth_pool<M: 'static + Middleware>(
+//         middleware: Arc<M>,
+//     ) -> eyre::Result<(UniswapV3Pool, u64)> {
+//         let mut pool = UniswapV3Pool {
+//             address: H160::from_str("0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640")?,
+//             ..Default::default()
+//         };
+//
+//         let creation_block = 12369620;
+//         pool.tick_spacing = pool.get_tick_spacing(middleware.clone()).await?;
+//         let synced_block = pool
+//             .populate_tick_data(creation_block, middleware.clone())
+//             .await?;
+//         pool.populate_data(Some(synced_block), middleware).await?;
+//
+//         Ok((pool, synced_block))
+//     }
+//
+//     async fn initialize_weth_link_pool<M: 'static + Middleware>(
+//         middleware: Arc<M>,
+//     ) -> eyre::Result<(UniswapV3Pool, u64)> {
+//         let mut pool = UniswapV3Pool {
+//             address: H160::from_str("0xa6Cc3C2531FdaA6Ae1A3CA84c2855806728693e8")?,
+//             ..Default::default()
+//         };
+//
+//         let creation_block = 12375680;
+//         pool.tick_spacing = pool.get_tick_spacing(middleware.clone()).await?;
+//         let synced_block = pool
+//             .populate_tick_data(creation_block, middleware.clone())
+//             .await?;
+//         pool.populate_data(Some(synced_block), middleware).await?;
+//
+//         Ok((pool, synced_block))
+//     }
+//
+//     #[tokio::test]
+//     #[ignore] //Ignoring to not throttle the Provider on workflows
+//     async fn test_simulate_swap_usdc_weth() -> eyre::Result<()> {
+//         let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
+//         let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
+//
+//         let (pool, synced_block) = initialize_usdc_weth_pool(middleware.clone()).await?;
+//         let quoter = IQuoter::new(
+//             H160::from_str("0xb27308f9f90d607463bb33ea1bebb41c27ce5ab6")?,
+//             middleware.clone(),
+//         );
+//         let amount_in = U256::from_dec_str("100000000")?; // 100 USDC
+//
+//         let amount_out = pool.simulate_swap(pool.token_a.address(), amount_in)?;
+//         let expected_amount_out = quoter
+//             .quote_exact_input_single(
+//                 pool.token_a.address(),
+//                 pool.token_b.address(),
+//                 pool.fee,
+//                 amount_in,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//         assert_eq!(amount_out, expected_amount_out);
+//         let amount_in_1 = U256::from_dec_str("10000000000")?; // 10_000 USDC
+//
+//         let amount_out_1 = pool.simulate_swap(pool.token_a.address(), amount_in_1)?;
+//
+//         let expected_amount_out_1 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_a.address(),
+//                 pool.token_b.address(),
+//                 pool.fee,
+//                 amount_in_1,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_1, expected_amount_out_1);
+//
+//         let amount_in_2 = U256::from_dec_str("10000000000000")?; // 10_000_000 USDC
+//
+//         let amount_out_2 = pool.simulate_swap(pool.token_a.address(), amount_in_2)?;
+//
+//         let expected_amount_out_2 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_a.address(),
+//                 pool.token_b.address(),
+//                 pool.fee,
+//                 amount_in_2,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_2, expected_amount_out_2);
+//
+//         let amount_in_3 = U256::from_dec_str("100000000000000")?; // 100_000_000 USDC
+//
+//         let amount_out_3 = pool.simulate_swap(pool.token_a.address(), amount_in_3)?;
+//
+//         let expected_amount_out_3 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_a.address(),
+//                 pool.token_b.address(),
+//                 pool.fee,
+//                 amount_in_3,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_3, expected_amount_out_3);
+//
+//         Ok(())
+//     }
+//
+//     #[tokio::test]
+//     #[ignore] //Ignoring to not throttle the Provider on workflows
+//     async fn test_simulate_swap_weth_usdc() -> eyre::Result<()> {
+//         let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
+//         let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
+//
+//         let (pool, synced_block) = initialize_usdc_weth_pool(middleware.clone()).await?;
+//         let quoter = IQuoter::new(
+//             H160::from_str("0xb27308f9f90d607463bb33ea1bebb41c27ce5ab6")?,
+//             middleware.clone(),
+//         );
+//
+//         let amount_in = U256::from_dec_str("1000000000000000000")?; // 1 ETH
+//
+//         let amount_out = pool.simulate_swap(pool.token_b.address(), amount_in)?;
+//         let expected_amount_out = quoter
+//             .quote_exact_input_single(
+//                 pool.token_b.address(),
+//                 pool.token_a.address(),
+//                 pool.fee,
+//                 amount_in,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//         assert_eq!(amount_out, expected_amount_out);
+//         let amount_in_1 = U256::from_dec_str("10000000000000000000")?; // 10 ETH
+//
+//         let amount_out_1 = pool.simulate_swap(pool.token_b.address(), amount_in_1)?;
+//
+//         let expected_amount_out_1 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_b.address(),
+//                 pool.token_a.address(),
+//                 pool.fee,
+//                 amount_in_1,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_1, expected_amount_out_1);
+//
+//         let amount_in_2 = U256::from_dec_str("100000000000000000000")?; // 100 ETH
+//
+//         let amount_out_2 = pool.simulate_swap(pool.token_b.address(), amount_in_2)?;
+//
+//         let expected_amount_out_2 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_b.address(),
+//                 pool.token_a.address(),
+//                 pool.fee,
+//                 amount_in_2,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_2, expected_amount_out_2);
+//
+//         let amount_in_3 = U256::from_dec_str("100000000000000000000")?; // 100_000 ETH
+//
+//         let amount_out_3 = pool.simulate_swap(pool.token_b.address(), amount_in_3)?;
+//
+//         let expected_amount_out_3 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_b.address(),
+//                 pool.token_a.address(),
+//                 pool.fee,
+//                 amount_in_3,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_3, expected_amount_out_3);
+//
+//         Ok(())
+//     }
+//
+//     #[tokio::test]
+//     #[ignore] //Ignoring to not throttle the Provider on workflows
+//     async fn test_simulate_swap_link_weth() -> eyre::Result<()> {
+//         let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
+//         let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
+//
+//         let (pool, synced_block) = initialize_weth_link_pool(middleware.clone()).await?;
+//         let quoter = IQuoter::new(
+//             H160::from_str("0xb27308f9f90d607463bb33ea1bebb41c27ce5ab6")?,
+//             middleware.clone(),
+//         );
+//
+//         let amount_in = U256::from_dec_str("1000000000000000000")?; // 1 LINK
+//
+//         let amount_out = pool.simulate_swap(pool.token_a.address(), amount_in)?;
+//         let expected_amount_out = quoter
+//             .quote_exact_input_single(
+//                 pool.token_a.address(),
+//                 pool.token_b.address(),
+//                 pool.fee,
+//                 amount_in,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//         assert_eq!(amount_out, expected_amount_out);
+//         let amount_in_1 = U256::from_dec_str("100000000000000000000")?; // 100 LINK
+//
+//         let amount_out_1 = pool.simulate_swap(pool.token_a.address(), amount_in_1)?;
+//
+//         let expected_amount_out_1 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_a.address(),
+//                 pool.token_b.address(),
+//                 pool.fee,
+//                 amount_in_1,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_1, expected_amount_out_1);
+//
+//         let amount_in_2 = U256::from_dec_str("10000000000000000000000")?; // 10_000 LINK
+//
+//         let amount_out_2 = pool.simulate_swap(pool.token_a.address(), amount_in_2)?;
+//
+//         let expected_amount_out_2 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_a.address(),
+//                 pool.token_b.address(),
+//                 pool.fee,
+//                 amount_in_2,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_2, expected_amount_out_2);
+//
+//         let amount_in_3 = U256::from_dec_str("10000000000000000000000")?; // 1_000_000 LINK
+//
+//         let amount_out_3 = pool.simulate_swap(pool.token_a.address(), amount_in_3)?;
+//
+//         let expected_amount_out_3 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_a.address(),
+//                 pool.token_b.address(),
+//                 pool.fee,
+//                 amount_in_3,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_3, expected_amount_out_3);
+//
+//         Ok(())
+//     }
+//
+//     #[tokio::test]
+//     #[ignore] //Ignoring to not throttle the Provider on workflows
+//     async fn test_simulate_swap_weth_link() -> eyre::Result<()> {
+//         let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
+//         let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
+//
+//         let (pool, synced_block) = initialize_weth_link_pool(middleware.clone()).await?;
+//         let quoter = IQuoter::new(
+//             H160::from_str("0xb27308f9f90d607463bb33ea1bebb41c27ce5ab6")?,
+//             middleware.clone(),
+//         );
+//
+//         let amount_in = U256::from_dec_str("1000000000000000000")?; // 1 ETH
+//
+//         let amount_out = pool.simulate_swap(pool.token_b.address(), amount_in)?;
+//         let expected_amount_out = quoter
+//             .quote_exact_input_single(
+//                 pool.token_b.address(),
+//                 pool.token_a.address(),
+//                 pool.fee,
+//                 amount_in,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//         assert_eq!(amount_out, expected_amount_out);
+//         let amount_in_1 = U256::from_dec_str("10000000000000000000")?; // 10 ETH
+//
+//         let amount_out_1 = pool.simulate_swap(pool.token_b.address(), amount_in_1)?;
+//
+//         let expected_amount_out_1 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_b.address(),
+//                 pool.token_a.address(),
+//                 pool.fee,
+//                 amount_in_1,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_1, expected_amount_out_1);
+//
+//         let amount_in_2 = U256::from_dec_str("100000000000000000000")?; // 100 ETH
+//
+//         let amount_out_2 = pool.simulate_swap(pool.token_b.address(), amount_in_2)?;
+//
+//         let expected_amount_out_2 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_b.address(),
+//                 pool.token_a.address(),
+//                 pool.fee,
+//                 amount_in_2,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_2, expected_amount_out_2);
+//
+//         let amount_in_3 = U256::from_dec_str("100000000000000000000")?; // 100_000 ETH
+//
+//         let amount_out_3 = pool.simulate_swap(pool.token_b.address(), amount_in_3)?;
+//
+//         let expected_amount_out_3 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_b.address(),
+//                 pool.token_a.address(),
+//                 pool.fee,
+//                 amount_in_3,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_3, expected_amount_out_3);
+//
+//         Ok(())
+//     }
+//
+//     #[tokio::test]
+//     #[ignore] //Ignoring to not throttle the Provider on workflows
+//     async fn test_simulate_swap_mut_usdc_weth() -> eyre::Result<()> {
+//         let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
+//         let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
+//
+//         let (pool, synced_block) = initialize_usdc_weth_pool(middleware.clone()).await?;
+//         let quoter = IQuoter::new(
+//             H160::from_str("0xb27308f9f90d607463bb33ea1bebb41c27ce5ab6")?,
+//             middleware.clone(),
+//         );
+//         let amount_in = U256::from_dec_str("100000000")?; // 100 USDC
+//
+//         let amount_out = pool.simulate_swap(pool.token_a.address(), amount_in)?;
+//         let expected_amount_out = quoter
+//             .quote_exact_input_single(
+//                 pool.token_a.address(),
+//                 pool.token_b.address(),
+//                 pool.fee,
+//                 amount_in,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//         assert_eq!(amount_out, expected_amount_out);
+//         let amount_in_1 = U256::from_dec_str("10000000000")?; // 10_000 USDC
+//
+//         let amount_out_1 = pool.simulate_swap(pool.token_a.address(), amount_in_1)?;
+//
+//         let expected_amount_out_1 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_a.address(),
+//                 pool.token_b.address(),
+//                 pool.fee,
+//                 amount_in_1,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_1, expected_amount_out_1);
+//
+//         let amount_in_2 = U256::from_dec_str("10000000000000")?; // 10_000_000 USDC
+//
+//         let amount_out_2 = pool.simulate_swap(pool.token_a.address(), amount_in_2)?;
+//
+//         let expected_amount_out_2 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_a.address(),
+//                 pool.token_b.address(),
+//                 pool.fee,
+//                 amount_in_2,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_2, expected_amount_out_2);
+//
+//         let amount_in_3 = U256::from_dec_str("100000000000000")?; // 100_000_000 USDC
+//
+//         let amount_out_3 = pool.simulate_swap(pool.token_a.address(), amount_in_3)?;
+//
+//         let expected_amount_out_3 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_a.address(),
+//                 pool.token_b.address(),
+//                 pool.fee,
+//                 amount_in_3,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_3, expected_amount_out_3);
+//
+//         Ok(())
+//     }
+//
+//     #[tokio::test]
+//     #[ignore] //Ignoring to not throttle the Provider on workflows
+//     async fn test_simulate_swap_mut_weth_usdc() -> eyre::Result<()> {
+//         let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
+//         let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
+//
+//         let (pool, synced_block) = initialize_usdc_weth_pool(middleware.clone()).await?;
+//         let quoter = IQuoter::new(
+//             H160::from_str("0xb27308f9f90d607463bb33ea1bebb41c27ce5ab6")?,
+//             middleware.clone(),
+//         );
+//
+//         let amount_in = U256::from_dec_str("1000000000000000000")?; // 1 ETH
+//
+//         let amount_out = pool.simulate_swap(pool.token_b.address(), amount_in)?;
+//         let expected_amount_out = quoter
+//             .quote_exact_input_single(
+//                 pool.token_b.address(),
+//                 pool.token_a.address(),
+//                 pool.fee,
+//                 amount_in,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//         assert_eq!(amount_out, expected_amount_out);
+//         let amount_in_1 = U256::from_dec_str("10000000000000000000")?; // 10 ETH
+//
+//         let amount_out_1 = pool.simulate_swap(pool.token_b.address(), amount_in_1)?;
+//
+//         let expected_amount_out_1 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_b.address(),
+//                 pool.token_a.address(),
+//                 pool.fee,
+//                 amount_in_1,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_1, expected_amount_out_1);
+//
+//         let amount_in_2 = U256::from_dec_str("100000000000000000000")?; // 100 ETH
+//
+//         let amount_out_2 = pool.simulate_swap(pool.token_b.address(), amount_in_2)?;
+//
+//         let expected_amount_out_2 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_b.address(),
+//                 pool.token_a.address(),
+//                 pool.fee,
+//                 amount_in_2,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_2, expected_amount_out_2);
+//
+//         let amount_in_3 = U256::from_dec_str("100000000000000000000")?; // 100_000 ETH
+//
+//         let amount_out_3 = pool.simulate_swap(pool.token_b.address(), amount_in_3)?;
+//
+//         let expected_amount_out_3 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_b.address(),
+//                 pool.token_a.address(),
+//                 pool.fee,
+//                 amount_in_3,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_3, expected_amount_out_3);
+//
+//         Ok(())
+//     }
+//
+//     #[tokio::test]
+//     #[ignore] //Ignoring to not throttle the Provider on workflows
+//     async fn test_simulate_swap_mut_link_weth() -> eyre::Result<()> {
+//         let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
+//         let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
+//
+//         let (pool, synced_block) = initialize_weth_link_pool(middleware.clone()).await?;
+//         let quoter = IQuoter::new(
+//             H160::from_str("0xb27308f9f90d607463bb33ea1bebb41c27ce5ab6")?,
+//             middleware.clone(),
+//         );
+//
+//         let amount_in = U256::from_dec_str("1000000000000000000")?; // 1 LINK
+//
+//         let amount_out = pool.simulate_swap(pool.token_a.address(), amount_in)?;
+//         let expected_amount_out = quoter
+//             .quote_exact_input_single(
+//                 pool.token_a.address(),
+//                 pool.token_b.address(),
+//                 pool.fee,
+//                 amount_in,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//         assert_eq!(amount_out, expected_amount_out);
+//         let amount_in_1 = U256::from_dec_str("100000000000000000000")?; // 100 LINK
+//
+//         let amount_out_1 = pool.simulate_swap(pool.token_a.address(), amount_in_1)?;
+//
+//         let expected_amount_out_1 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_a.address(),
+//                 pool.token_b.address(),
+//                 pool.fee,
+//                 amount_in_1,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_1, expected_amount_out_1);
+//
+//         let amount_in_2 = U256::from_dec_str("10000000000000000000000")?; // 10_000 LINK
+//
+//         let amount_out_2 = pool.simulate_swap(pool.token_a.address(), amount_in_2)?;
+//
+//         let expected_amount_out_2 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_a.address(),
+//                 pool.token_b.address(),
+//                 pool.fee,
+//                 amount_in_2,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_2, expected_amount_out_2);
+//
+//         let amount_in_3 = U256::from_dec_str("10000000000000000000000")?; // 1_000_000 LINK
+//
+//         let amount_out_3 = pool.simulate_swap(pool.token_a.address(), amount_in_3)?;
+//
+//         let expected_amount_out_3 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_a.address(),
+//                 pool.token_b.address(),
+//                 pool.fee,
+//                 amount_in_3,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_3, expected_amount_out_3);
+//
+//         Ok(())
+//     }
+//
+//     #[tokio::test]
+//     #[ignore] //Ignoring to not throttle the Provider on workflows
+//     async fn test_simulate_swap_mut_weth_link() -> eyre::Result<()> {
+//         let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
+//         let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
+//
+//         let (pool, synced_block) = initialize_weth_link_pool(middleware.clone()).await?;
+//         let quoter = IQuoter::new(
+//             H160::from_str("0xb27308f9f90d607463bb33ea1bebb41c27ce5ab6")?,
+//             middleware.clone(),
+//         );
+//
+//         let amount_in = U256::from_dec_str("1000000000000000000")?; // 1 ETH
+//
+//         let amount_out = pool.simulate_swap(pool.token_b.address(), amount_in)?;
+//         let expected_amount_out = quoter
+//             .quote_exact_input_single(
+//                 pool.token_b.address(),
+//                 pool.token_a.address(),
+//                 pool.fee,
+//                 amount_in,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//         assert_eq!(amount_out, expected_amount_out);
+//         let amount_in_1 = U256::from_dec_str("10000000000000000000")?; // 10 ETH
+//
+//         let amount_out_1 = pool.simulate_swap(pool.token_b.address(), amount_in_1)?;
+//
+//         let expected_amount_out_1 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_b.address(),
+//                 pool.token_a.address(),
+//                 pool.fee,
+//                 amount_in_1,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_1, expected_amount_out_1);
+//
+//         let amount_in_2 = U256::from_dec_str("100000000000000000000")?; // 100 ETH
+//
+//         let amount_out_2 = pool.simulate_swap(pool.token_b.address(), amount_in_2)?;
+//
+//         let expected_amount_out_2 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_b.address(),
+//                 pool.token_a.address(),
+//                 pool.fee,
+//                 amount_in_2,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_2, expected_amount_out_2);
+//
+//         let amount_in_3 = U256::from_dec_str("100000000000000000000")?; // 100_000 ETH
+//
+//         let amount_out_3 = pool.simulate_swap(pool.token_b.address(), amount_in_3)?;
+//
+//         let expected_amount_out_3 = quoter
+//             .quote_exact_input_single(
+//                 pool.token_b.address(),
+//                 pool.token_a.address(),
+//                 pool.fee,
+//                 amount_in_3,
+//                 U256::zero(),
+//             )
+//             .block(synced_block)
+//             .call()
+//             .await?;
+//
+//         assert_eq!(amount_out_3, expected_amount_out_3);
+//
+//         Ok(())
+//     }
+//
+//     #[tokio::test]
+//     #[ignore] //Ignoring to not throttle the Provider on workflows
+//     async fn test_get_new_from_address() -> eyre::Result<()> {
+//         let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
+//         let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
+//
+//         let pool = UniswapV3Pool::new_from_address(
+//             H160::from_str("0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640")?,
+//             12369620,
+//             middleware.clone(),
+//         )
+//             .await?;
+//
+//         assert_eq!(
+//             pool.address,
+//             H160::from_str("0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640")?
+//         );
+//         assert_eq!(
+//             pool.token_a.address(),
+//             H160::from_str("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")?
+//         );
+//         assert_eq!(pool.token_a.decimals(), 6);
+//         assert_eq!(
+//             pool.token_b.address(),
+//             H160::from_str("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")?
+//         );
+//         assert_eq!(pool.token_b.decimals(), 18);
+//         assert_eq!(pool.fee, 500);
+//         assert!(pool.tick != 0);
+//         assert_eq!(pool.tick_spacing, 10);
+//
+//         Ok(())
+//     }
+//
+//     #[tokio::test]
+//     #[ignore] //Ignoring to not throttle the Provider on workflows
+//     async fn test_get_pool_data() -> eyre::Result<()> {
+//         let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
+//         let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
+//
+//         let (pool, _synced_block) = initialize_usdc_weth_pool(middleware.clone()).await?;
+//         assert_eq!(
+//             pool.address,
+//             H160::from_str("0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640")?
+//         );
+//         assert_eq!(
+//             pool.token_a.address(),
+//             H160::from_str("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")?
+//         );
+//         assert_eq!(pool.token_a.decimals(), 6);
+//         assert_eq!(
+//             pool.token_b.address(),
+//             H160::from_str("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")?
+//         );
+//         assert_eq!(pool.token_b.decimals(), 18);
+//         assert_eq!(pool.fee, 500);
+//         assert!(pool.tick != 0);
+//         assert_eq!(pool.tick_spacing, 10);
+//
+//         Ok(())
+//     }
+//
+//     #[tokio::test]
+//     async fn test_sync_pool() -> eyre::Result<()> {
+//         let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
+//         let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
+//
+//         let mut pool = UniswapV3Pool {
+//             address: H160::from_str("0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640")?,
+//             ..Default::default()
+//         };
+//
+//         pool.sync(middleware).await?;
+//
+//         //TODO: need to assert values
+//
+//         Ok(())
+//     }
+//
+//     #[tokio::test]
+//     async fn test_calculate_virtual_reserves() -> eyre::Result<()> {
+//         let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
+//         let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
+//
+//         let mut pool = UniswapV3Pool {
+//             address: H160::from_str("0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640")?,
+//             ..Default::default()
+//         };
+//
+//         pool.populate_data(None, middleware.clone()).await?;
+//
+//         let pool_at_block = IUniswapV3Pool::new(
+//             H160::from_str("0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640")?,
+//             middleware.clone(),
+//         );
+//
+//         let sqrt_price = pool_at_block.slot_0().block(16515398).call().await?.0;
+//         let liquidity = pool_at_block.liquidity().block(16515398).call().await?;
+//
+//         pool.sqrt_price = sqrt_price;
+//         pool.liquidity = liquidity;
+//
+//         let (r_0, r_1) = pool.calculate_virtual_reserves()?;
+//
+//         assert_eq!(1067543429906214, r_0);
+//         assert_eq!(649198362624067343572319, r_1);
+//
+//         Ok(())
+//     }
+//
+//     #[tokio::test]
+//     async fn test_calculate_price() -> eyre::Result<()> {
+//         let rpc_endpoint = std::env::var("ETHEREUM_RPC_ENDPOINT")?;
+//         let middleware = Arc::new(Provider::<Http>::try_from(rpc_endpoint)?);
+//
+//         let mut pool = UniswapV3Pool {
+//             address: H160::from_str("0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640")?,
+//             ..Default::default()
+//         };
+//
+//         pool.populate_data(None, middleware.clone()).await?;
+//
+//         let block_pool = IUniswapV3Pool::new(
+//             H160::from_str("0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640")?,
+//             middleware.clone(),
+//         );
+//
+//         let sqrt_price = block_pool.slot_0().block(16515398).call().await?.0;
+//         pool.sqrt_price = sqrt_price;
+//
+//         let float_price_a = pool.calculate_price(pool.token_a)?;
+//         let float_price_b = pool.calculate_price(pool.token_b)?;
+//
+//         assert_eq!(float_price_a, 0.0006081236083117488);
+//         assert_eq!(float_price_b, 1644.4025299004006);
+//
+//         Ok(())
+//     }
+// }

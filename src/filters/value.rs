@@ -1,10 +1,11 @@
+use std::sync::Arc;
+
 use ethers::{
     abi::{ParamType, Token},
     prelude::abigen,
     providers::Middleware,
     types::{Bytes, H160, U256},
 };
-use std::sync::Arc;
 
 use crate::{
     amm::{factory::AutomatedMarketMakerFactory, factory::Factory, AutomatedMarketMaker, AMM},
@@ -153,7 +154,6 @@ async fn get_weth_value_in_amm_batch_request<M: Middleware>(
         .iter()
         .map(|d| match d {
             Factory::UniswapV2Factory(_) => Token::Bool(false),
-            Factory::UniswapV3Factory(_) => Token::Bool(true),
         })
         .collect::<Vec<Token>>();
 

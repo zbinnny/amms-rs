@@ -12,7 +12,6 @@ use crate::{
 
 pub enum DiscoverableFactory {
     UniswapV2Factory,
-    UniswapV3Factory,
 }
 
 impl DiscoverableFactory {
@@ -20,10 +19,6 @@ impl DiscoverableFactory {
         match self {
             DiscoverableFactory::UniswapV2Factory => {
                 amm::uniswap_v2::factory::PAIR_CREATED_EVENT_SIGNATURE
-            }
-
-            DiscoverableFactory::UniswapV3Factory => {
-                amm::uniswap_v3::factory::POOL_CREATED_EVENT_SIGNATURE
             }
         }
     }
@@ -83,13 +78,6 @@ pub async fn discover_factories<M: Middleware>(
                     Factory::UniswapV2Factory(uniswap_v2_factory) => {
                         uniswap_v2_factory.address = log.address;
                         uniswap_v2_factory.creation_block = log
-                            .block_number
-                            .ok_or(AMMError::BlockNumberNotFound)?
-                            .as_u64();
-                    }
-                    Factory::UniswapV3Factory(uniswap_v3_factory) => {
-                        uniswap_v3_factory.address = log.address;
-                        uniswap_v3_factory.creation_block = log
                             .block_number
                             .ok_or(AMMError::BlockNumberNotFound)?
                             .as_u64();

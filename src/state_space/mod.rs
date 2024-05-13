@@ -1,20 +1,12 @@
-#[cfg(feature = "artemis")]
-pub mod collector;
-pub mod error;
-
-use crate::{
-    amm::{AutomatedMarketMaker, AMM},
-    errors::EventLogError,
-};
-use arraydeque::ArrayDeque;
-use error::{StateChangeError, StateSpaceError};
-use ethers::{
-    providers::{Middleware, PubsubClient, StreamExt},
-    types::{Block, Filter, Log, H160, H256},
-};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+};
+
+use arraydeque::ArrayDeque;
+use ethers::{
+    providers::{Middleware, PubsubClient, StreamExt},
+    types::{Block, Filter, Log, H160, H256},
 };
 use tokio::{
     sync::{
@@ -23,6 +15,17 @@ use tokio::{
     },
     task::JoinHandle,
 };
+
+use error::{StateChangeError, StateSpaceError};
+
+use crate::{
+    amm::{AutomatedMarketMaker, AMM},
+    errors::EventLogError,
+};
+
+#[cfg(feature = "artemis")]
+pub mod collector;
+pub mod error;
 
 //TODO: bench this with a dashmap
 pub type StateSpace = HashMap<H160, AMM>;
@@ -85,8 +88,6 @@ where
         for amm in self.state.read().await.values() {
             let variant = match amm {
                 AMM::UniswapV2Pool(_) => 0,
-                AMM::UniswapV3Pool(_) => 1,
-                AMM::ERC4626Vault(_) => 2,
             };
 
             if !amm_variants.contains(&variant) {
@@ -446,17 +447,18 @@ pub fn get_block_number_from_log(log: &Log) -> Result<u64, EventLogError> {
 mod tests {
     use std::{default, sync::Arc};
 
-    use crate::amm::{uniswap_v2::UniswapV2Pool, AMM};
     use ethers::{
         providers::{Http, Middleware, Provider, Ws},
         types::H160,
     };
     use tokio::sync::RwLock;
 
-    use super::StateSpaceManager;
+    use crate::amm::{uniswap_v2::UniswapV2Pool, AMM};
     use crate::state_space::{
         add_state_change_to_cache, unwind_state_changes, StateChange, StateChangeCache,
     };
+
+    use super::StateSpaceManager;
 
     #[tokio::test]
     async fn test_add_state_changes() -> eyre::Result<()> {

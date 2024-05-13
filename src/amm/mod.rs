@@ -1,41 +1,36 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
-use ethers::{
-    providers::Middleware,
-    types::{H160, H256, Log, U256},
-};
+use ethers::types::{Log, H160, H256, U256};
 use serde::{Deserialize, Serialize};
 
-use crate::errors::{AMMError, ArithmeticError, EventLogError, SwapSimulationError};
+use crate::currency::Currency;
+use crate::errors::{ArithmeticError, EventLogError, SwapSimulationError};
 
-use self::{erc_4626::ERC4626Vault, uniswap_v2::UniswapV2Pool, uniswap_v3::UniswapV3Pool};
+use self::uniswap_v2::UniswapV2Pool;
 
-pub mod erc_4626;
 pub mod factory;
 pub mod uniswap_v2;
-pub mod uniswap_v3;
 
 #[async_trait]
 pub trait AutomatedMarketMaker {
     /// Returns the address of the AMM.
     fn address(&self) -> H160;
 
-    /// Returns a vector of tokens in the AMM.
+    /// 返回池子相关的所有货币地址
     fn tokens(&self) -> Vec<H160>;
 
+    /// 返回这个池子相关的所有货币信息
+    fn currencies(&self) -> Vec<Currency>;
+
+    fn set_currency(&mut self, currency: Currency);
+
+    /// 最后同步的日志
     fn last_synced_log(&self) -> (u64, u64);
 
     /// Returns the vector of event signatures subscribed to when syncing the AMM.
     fn sync_on_event_signatures(&self) -> Vec<H256>;
-    /// Syncs the AMM data on chain via batched static calls.
-    async fn sync<M: Middleware>(&mut self, middleware: Arc<M>) -> Result<(), AMMError<M>>;
 
     /// Updates the AMM data from a log.
     fn sync_from_log(&mut self, log: Log) -> Result<(), EventLogError>;
-
-    /// Populates the AMM data via batched static calls.
-    async fn populate_data<M: Middleware>(&mut self, block_number: Option<u64>, middleware: Arc<M>) -> Result<(), AMMError<M>>;
 
     /// Calculates a f64 representation of base token price in the AMM.
     fn calculate_price(&self, base_token: H160) -> Result<f64, ArithmeticError>;
@@ -51,7 +46,11 @@ pub trait AutomatedMarketMaker {
     /// Locally simulates a swap in the AMM.
     /// Mutates the AMM state to the state of the AMM after swapping.
     /// Returns the amount received for `amount_in` of `token_in`.
-    fn simulate_swap_mut(&mut self, token_in: H160, amount_in: U256) -> Result<U256, SwapSimulationError>;
+    fn simulate_swap_mut(
+        &mut self,
+        token_in: H160,
+        amount_in: U256,
+    ) -> Result<U256, SwapSimulationError>;
 }
 
 macro_rules! amm {
@@ -75,6 +74,18 @@ macro_rules! amm {
                 }
             }
 
+            fn currencies(&self) -> Vec<Currency> {
+                match self {
+                    $(AMM::$pool_type(pool) => pool.currencies(),)+
+                }
+            }
+
+            fn set_currency(&mut self, currency: Currency) {
+                match self {
+                    $(AMM::$pool_type(pool) => pool.set_currency(currency),)+
+                }
+            }
+
             fn last_synced_log(&self) -> (u64, u64) {
                 match self {
                     $(AMM::$pool_type(pool) => pool.last_synced_log(),)+
@@ -87,21 +98,9 @@ macro_rules! amm {
                 }
             }
 
-            async fn sync<M: Middleware>(&mut self, middleware: Arc<M>) -> Result<(), AMMError<M>> {
-                match self {
-                    $(AMM::$pool_type(pool) => pool.sync(middleware).await,)+
-                }
-            }
-
             fn sync_from_log(&mut self, log: Log) -> Result<(), EventLogError> {
                 match self {
                     $(AMM::$pool_type(pool) => pool.sync_from_log(log),)+
-                }
-            }
-
-            async fn populate_data<M: Middleware>(&mut self, block_number: Option<u64>, middleware: Arc<M>) -> Result<(), AMMError<M>> {
-                match self {
-                    $(AMM::$pool_type(pool) => pool.populate_data(block_number, middleware).await,)+
                 }
             }
 
@@ -110,7 +109,7 @@ macro_rules! amm {
                     $(AMM::$pool_type(pool) => pool.calculate_price(base_token),)+
                 }
             }
-            
+
             fn get_token_out(&self, token_in: H160) -> H160 {
                 match self {
                     $(AMM::$pool_type(pool) => pool.get_token_out(token_in),)+
@@ -132,4 +131,4 @@ macro_rules! amm {
     };
 }
 
-amm!(UniswapV2Pool, UniswapV3Pool, ERC4626Vault);
+amm!(UniswapV2Pool);
