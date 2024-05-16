@@ -70,6 +70,10 @@ impl AutomatedMarketMaker for UniswapV2Pool {
         vec![self.token_a.clone(), self.token_b.clone()]
     }
 
+    fn reserves(&self) -> Vec<u128> {
+        vec![self.reserve_0, self.reserve_1]
+    }
+
     fn set_currency(&mut self, currency: Currency) {
         match currency.address() {
             v if v == self.token_a.address() => {
@@ -84,6 +88,14 @@ impl AutomatedMarketMaker for UniswapV2Pool {
 
     fn last_synced_log(&self) -> (u64, u64) {
         self.last_synced_log
+    }
+
+    fn data_is_populated(&self) -> bool {
+        self.token_a.data_is_populated()
+            && self.token_b.data_is_populated()
+            && self.last_synced_log != (0, 0)
+            && self.reserve_0 != 0
+            && self.reserve_1 != 0
     }
 
     fn sync_on_event_signatures(&self) -> Vec<H256> {
@@ -105,7 +117,7 @@ impl AutomatedMarketMaker for UniswapV2Pool {
             }
 
             let sync_event = SyncFilter::decode_log(&RawLog::from(log))?;
-            tracing::info!(log_index = ?new_log_index, reserve_0 = sync_event.reserve_0, reserve_1 = sync_event.reserve_1, address = ?self.address, "UniswapV2 sync event");
+            tracing::debug!(log_index = ?new_log_index, reserve_0 = sync_event.reserve_0, reserve_1 = sync_event.reserve_1, address = ?self.address, "UniswapV2 sync event");
 
             self.reserve_0 = sync_event.reserve_0;
             self.reserve_1 = sync_event.reserve_1;
@@ -146,11 +158,7 @@ impl AutomatedMarketMaker for UniswapV2Pool {
         }
     }
 
-    fn simulate_swap_mut(
-        &mut self,
-        token_in: H160,
-        amount_in: U256,
-    ) -> Result<U256, SwapSimulationError> {
+    fn simulate_swap_mut(&mut self, token_in: H160, amount_in: U256) -> Result<U256, SwapSimulationError> {
         if self.token_a.address() == token_in {
             let amount_out = self.get_amount_out(
                 amount_in,
@@ -241,8 +249,8 @@ impl UniswapV2Pool {
 
     /// Returns whether the pool data is populated.
     pub fn data_is_populated(&self) -> bool {
-        self.token_a.data_is_filled()
-            && self.token_b.data_is_filled()
+        self.token_a.data_is_populated()
+            && self.token_b.data_is_populated()
             && self.reserve_0 != 0
             && self.reserve_1 != 0
     }

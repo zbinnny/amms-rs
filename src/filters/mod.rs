@@ -9,8 +9,8 @@ pub fn filter_empty_amms(amms: Vec<AMM>) -> Vec<AMM> {
     for amm in amms.into_iter() {
         match amm {
             AMM::UniswapV2Pool(ref uniswap_v2_pool) => {
-                if uniswap_v2_pool.token_a.data_is_filled()
-                    && !uniswap_v2_pool.token_b.data_is_filled()
+                if uniswap_v2_pool.token_a.data_is_populated()
+                    && !uniswap_v2_pool.token_b.data_is_populated()
                 {
                     cleaned_amms.push(amm)
                 }

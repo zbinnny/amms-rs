@@ -4,9 +4,10 @@ use std::{
     fs::read_to_string,
     sync::Arc,
 };
+use std::fmt::{Display, Formatter};
 
 use ethers::{
-    prelude::{Filter, H160, H256},
+    prelude::{Filter, H160},
     providers::Middleware,
 };
 use ethers::prelude::{Address, Log, StreamExt};
@@ -23,6 +24,7 @@ use crate::{
     errors::{AMMError, CheckpointError, EventLogError},
     sync::serde_with::*,
 };
+use crate::amm::amm_sync_event_signatures;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Checkpoint {
@@ -44,6 +46,21 @@ pub struct Checkpoint {
     pub currencies: HashMap<H160, Currency>,
     // 货币黑名单, 用于过滤掉无效的货币
     pub currencies_blacklist: HashSet<Address>,
+}
+
+impl Display for Checkpoint {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let last_synced_log_block = self.amms.iter().map(|(_, amm)| amm.last_synced_log().0).max().unwrap_or(0);
+        write!(f, "Checkpoint(block_number: {}, factories: {}, amms: {}, invalid_amms: {}, currencies: {}, currencies_blacklist: {}, last_synced_log: {})",
+               self.block_number.unwrap_or_default(),
+               self.factories.len(),
+               self.amms.len(),
+               self.amms.iter().filter(|(_, amm)| amm.last_synced_log().0 == 0).count(),
+               self.currencies.len(),
+               self.currencies_blacklist.len(),
+               last_synced_log_block,
+        )
+    }
 }
 
 impl Checkpoint {
@@ -195,8 +212,7 @@ impl Checkpoint {
             missing_currencies.clone().into_iter().collect(),
             Some(step),
             middleware.clone(),
-        )
-            .await?;
+        ).await?;
         tracing::info!("加载缺失的currency信息完成. 共加载{}个", currencies.len());
 
         if currencies.is_empty() {
@@ -226,7 +242,7 @@ impl Checkpoint {
         // 再次填充amm的currency信息
         for (_, amm) in self.amms.iter_mut() {
             for currency in amm.currencies().iter() {
-                if currency.data_is_filled() {
+                if currency.data_is_populated() {
                     continue;
                 }
 
@@ -240,26 +256,6 @@ impl Checkpoint {
         Ok(())
     }
 
-    /// Amm同步事件过滤器
-    fn amm_sync_event_filter(&self) -> Filter {
-        let mut event_signatures: Vec<H256> = vec![];
-        let mut amm_variants = HashSet::new();
-
-        for (_, amm) in self.amms.iter() {
-            let variant = match amm {
-                AMM::UniswapV2Pool(_) => 0,
-            };
-
-            if !amm_variants.contains(&variant) {
-                amm_variants.insert(variant);
-                event_signatures.extend(amm.sync_on_event_signatures());
-            }
-        }
-
-        //Create a new filter
-        Filter::new().topic0(event_signatures)
-    }
-
     /// 同步amms的深度数据
     pub async fn sync_amms_reserve<M: 'static + Middleware>(
         &mut self,
@@ -271,10 +267,12 @@ impl Checkpoint {
             .map_err(AMMError::MiddlewareError)?
             .as_u64();
 
-        let block_filter = self.amm_sync_event_filter();
+        // 创建事件过滤器
+        let event_signatures = amm_sync_event_signatures(&self.amms);
+        let block_filter = Filter::new().topic0(event_signatures);
 
         let mut start_block = self.last_synced_log_block() + 1; // +1, 因为当前块已经同步过了, 从下一个块开始查起
-        let step = 200000u64;
+        let step = 2500u64;
 
         loop {
             if start_block >= latest_block {
@@ -319,7 +317,7 @@ async fn batch_request_logs<M: 'static + Middleware>(
 
     // 初始化并发任务
     let mut futures = FuturesUnordered::new();
-    let step = 200;
+    let step = 250;
     for i in (start_block..=end_block).step_by(step) {
         let filter = filter.clone().from_block(i).to_block(min(i + step as u64, end_block));
         let middleware = middleware.clone();
@@ -347,15 +345,11 @@ async fn batch_request_logs<M: 'static + Middleware>(
         }
     }
 
-    Ok(logs.into_iter().map(|(_, log)| log).collect())
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_checkpoint() {
-        for i in (0..=1000).step_by(200) {
-            println!("{}, {}", i, i + 200)
-        }
-    }
+    let mut logs: Vec<Log> = logs.into_iter().map(|(_, log)| log).collect();
+    logs.sort_by(|a, b| {
+        let a_index = (a.block_number.unwrap().as_u64(), a.log_index.unwrap().as_u64());
+        let b_index = (b.block_number.unwrap().as_u64(), b.log_index.unwrap().as_u64());
+        a_index.cmp(&b_index)
+    });
+    Ok(logs)
 }

@@ -1,5 +1,8 @@
+use std::collections::{HashMap, HashSet};
+
 use async_trait::async_trait;
-use ethers::types::{Log, H160, H256, U256};
+use ethers::prelude::Address;
+use ethers::types::{H160, H256, Log, U256};
 use serde::{Deserialize, Serialize};
 
 use crate::currency::Currency;
@@ -21,10 +24,15 @@ pub trait AutomatedMarketMaker {
     /// 返回这个池子相关的所有货币信息
     fn currencies(&self) -> Vec<Currency>;
 
+    fn reserves(&self) -> Vec<u128>;
+
     fn set_currency(&mut self, currency: Currency);
 
     /// 最后同步的日志
     fn last_synced_log(&self) -> (u64, u64);
+
+    /// 数据是否已填充
+    fn data_is_populated(&self) -> bool;
 
     /// Returns the vector of event signatures subscribed to when syncing the AMM.
     fn sync_on_event_signatures(&self) -> Vec<H256>;
@@ -86,9 +94,21 @@ macro_rules! amm {
                 }
             }
 
+            fn reserves(&self) -> Vec<u128> {
+                match self {
+                    $(AMM::$pool_type(pool) => pool.reserves(),)+
+                }
+            }
+
             fn last_synced_log(&self) -> (u64, u64) {
                 match self {
                     $(AMM::$pool_type(pool) => pool.last_synced_log(),)+
+                }
+            }
+
+            fn data_is_populated(&self) -> bool {
+                match self {
+                    $(AMM::$pool_type(pool) => pool.data_is_populated(),)+
                 }
             }
 
@@ -132,3 +152,23 @@ macro_rules! amm {
 }
 
 amm!(UniswapV2Pool);
+
+
+pub fn amm_sync_event_signatures(amms: &HashMap<Address, AMM>) -> Vec<H256> {
+    let mut event_signatures: Vec<H256> = vec![];
+    let mut amm_variants = HashSet::new();
+
+    for (_, amm) in amms.iter() {
+        let variant = match amm {
+            AMM::UniswapV2Pool(_) => 0,
+        };
+
+        if !amm_variants.contains(&variant) {
+            amm_variants.insert(variant);
+            event_signatures.extend(amm.sync_on_event_signatures());
+        }
+    }
+
+    //Create a new filter
+    event_signatures
+}
