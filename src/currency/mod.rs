@@ -61,8 +61,8 @@ impl Currency {
 }
 
 impl<H> From<H> for Currency
-    where
-        H: Into<Address>,
+where
+    H: Into<Address>,
 {
     fn from(address: H) -> Self {
         Self::new(address)
@@ -191,9 +191,9 @@ mod tests {
             // "0xac6f8d7c06658f1540c1b207203cebdd60ef71cf",
             // "0x48f7d215f70c804f178ae0fe9d5fac2a9e2a8e94",
         ]
-            .into_iter()
-            .map(|a| Address::from_str(a).unwrap())
-            .collect();
+        .into_iter()
+        .map(|a| Address::from_str(a).unwrap())
+        .collect();
 
         let result = batch_get_currency_info(currencies.clone(), Some(100), middleware)
             .await

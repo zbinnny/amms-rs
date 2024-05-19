@@ -1,30 +1,30 @@
+use std::fmt::{Display, Formatter};
 use std::{
     cmp::min,
     collections::{HashMap, HashSet},
     fs::read_to_string,
     sync::Arc,
 };
-use std::fmt::{Display, Formatter};
 
+use ethers::prelude::{Address, Log, StreamExt};
 use ethers::{
     prelude::{Filter, H160},
     providers::Middleware,
 };
-use ethers::prelude::{Address, Log, StreamExt};
 use futures::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
 
+use crate::amm::amm_sync_event_signatures;
 use crate::{
     amm::{
-        AMM,
-        AutomatedMarketMaker,
-        factory::{AutomatedMarketMakerFactory, FactoryHelper}, factory::Factory,
+        factory::Factory,
+        factory::{AutomatedMarketMakerFactory, FactoryHelper},
+        AutomatedMarketMaker, AMM,
     },
     currency::{batch_get_currency_info, Currency},
     errors::{AMMError, CheckpointError, EventLogError},
     sync::serde_with::*,
 };
-use crate::amm::amm_sync_event_signatures;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Checkpoint {
@@ -50,7 +50,12 @@ pub struct Checkpoint {
 
 impl Display for Checkpoint {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let last_synced_log_block = self.amms.iter().map(|(_, amm)| amm.last_synced_log().0).max().unwrap_or(0);
+        let last_synced_log_block = self
+            .amms
+            .iter()
+            .map(|(_, amm)| amm.last_synced_log().0)
+            .max()
+            .unwrap_or(0);
         write!(f, "Checkpoint(block_number: {}, factories: {}, amms: {}, invalid_amms: {}, currencies: {}, currencies_blacklist: {}, last_synced_log: {})",
                self.block_number.unwrap_or_default(),
                self.factories.len(),
@@ -110,7 +115,6 @@ impl Checkpoint {
             .map(|(_, amm)| amm.last_synced_log().0)
             .max()
             .unwrap_or(0);
-
 
         if last_synced_block == 0 {
             self.factories
@@ -191,14 +195,18 @@ impl Checkpoint {
     ) -> Result<(), AMMError<M>> {
         let mut missing_currencies = HashSet::new();
         for (_, amm) in self.amms.iter_mut() {
+            let mut currencies = vec![];
             for token in amm.tokens().iter() {
                 match self.currencies.get(token) {
                     None => {
-                        // 收集缺失的currency
-                        missing_currencies.insert(token.clone());
+                        missing_currencies.insert(token.clone()); // 收集缺失的currency
                     }
-                    Some(currency) => amm.set_currency(currency.clone()), // 更新amm的currency信息
+                    Some(currency) => currencies.push(currency.clone()), // 收集amm的currency信息
                 }
+            }
+
+            match amm {
+                AMM::UniswapV2Pool(v2_pool) => v2_pool.set_currencies(currencies),
             }
         }
 
@@ -212,7 +220,8 @@ impl Checkpoint {
             missing_currencies.clone().into_iter().collect(),
             Some(step),
             middleware.clone(),
-        ).await?;
+        )
+        .await?;
         tracing::info!("加载缺失的currency信息完成. 共加载{}个", currencies.len());
 
         if currencies.is_empty() {
@@ -241,15 +250,23 @@ impl Checkpoint {
 
         // 再次填充amm的currency信息
         for (_, amm) in self.amms.iter_mut() {
-            for currency in amm.currencies().iter() {
-                if currency.data_is_populated() {
+            match amm {
+                AMM::UniswapV2Pool(v2_pool) if v2_pool.data_is_populated() => {
                     continue;
                 }
+                _ => {}
+            }
 
-                match self.currencies.get(&currency.address()) {
+            let mut currencies = vec![];
+            for token in amm.tokens().iter() {
+                match self.currencies.get(token) {
                     None => continue,
-                    Some(currency) => amm.set_currency(currency.clone()), // 更新amm的currency信息
+                    Some(currency) => currencies.push(currency.clone()), // 更新amm的currency信息
                 }
+            }
+
+            match amm {
+                AMM::UniswapV2Pool(v2_pool) => v2_pool.set_currencies(currencies),
             }
         }
 
@@ -287,7 +304,13 @@ impl Checkpoint {
                 target_block,
                 latest_block
             );
-            let logs = batch_request_logs(middleware.clone(), block_filter.clone(), start_block, target_block).await?; // 请求日志
+            let logs = batch_request_logs(
+                middleware.clone(),
+                block_filter.clone(),
+                start_block,
+                target_block,
+            )
+            .await?; // 请求日志
 
             for log in logs {
                 // 检查是否是状态空间中的amm的日志
@@ -307,22 +330,28 @@ impl Checkpoint {
     }
 }
 
-
 async fn batch_request_logs<M: 'static + Middleware>(
     middleware: Arc<M>,
     filter: Filter,
     start_block: u64,
     end_block: u64,
 ) -> Result<Vec<Log>, AMMError<M>> {
-
     // 初始化并发任务
     let mut futures = FuturesUnordered::new();
     let step = 250;
     for i in (start_block..=end_block).step_by(step) {
-        let filter = filter.clone().from_block(i).to_block(min(i + step as u64, end_block));
+        let filter = filter
+            .clone()
+            .from_block(i)
+            .to_block(min(i + step as u64, end_block));
         let middleware = middleware.clone();
 
-        futures.push(async move { middleware.get_logs(&filter).await.map_err(AMMError::MiddlewareError) });
+        futures.push(async move {
+            middleware
+                .get_logs(&filter)
+                .await
+                .map_err(AMMError::MiddlewareError)
+        });
     }
 
     // 并发请求日志
@@ -335,8 +364,14 @@ async fn batch_request_logs<M: 'static + Middleware>(
                     logs.insert(log.address, log);
                 }
                 Some(old) => {
-                    let new_log_index = (log.block_number.unwrap().as_u64(), log.log_index.unwrap().as_u64());
-                    let old_log_index = (old.block_number.unwrap().as_u64(), old.log_index.unwrap().as_u64());
+                    let new_log_index = (
+                        log.block_number.unwrap().as_u64(),
+                        log.log_index.unwrap().as_u64(),
+                    );
+                    let old_log_index = (
+                        old.block_number.unwrap().as_u64(),
+                        old.log_index.unwrap().as_u64(),
+                    );
                     if new_log_index > old_log_index {
                         logs.insert(log.address, log);
                     }
@@ -347,8 +382,14 @@ async fn batch_request_logs<M: 'static + Middleware>(
 
     let mut logs: Vec<Log> = logs.into_iter().map(|(_, log)| log).collect();
     logs.sort_by(|a, b| {
-        let a_index = (a.block_number.unwrap().as_u64(), a.log_index.unwrap().as_u64());
-        let b_index = (b.block_number.unwrap().as_u64(), b.log_index.unwrap().as_u64());
+        let a_index = (
+            a.block_number.unwrap().as_u64(),
+            a.log_index.unwrap().as_u64(),
+        );
+        let b_index = (
+            b.block_number.unwrap().as_u64(),
+            b.log_index.unwrap().as_u64(),
+        );
         a_index.cmp(&b_index)
     });
     Ok(logs)

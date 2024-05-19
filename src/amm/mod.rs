@@ -2,10 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use ethers::prelude::Address;
-use ethers::types::{H160, H256, Log, U256};
+use ethers::types::{Log, H160, H256, U256};
 use serde::{Deserialize, Serialize};
 
-use crate::currency::Currency;
 use crate::errors::{ArithmeticError, EventLogError, SwapSimulationError};
 
 use self::uniswap_v2::UniswapV2Pool;
@@ -21,18 +20,22 @@ pub trait AutomatedMarketMaker {
     /// 返回池子相关的所有货币地址
     fn tokens(&self) -> Vec<H160>;
 
-    /// 返回这个池子相关的所有货币信息
-    fn currencies(&self) -> Vec<Currency>;
+    fn get_symbol(&self, token: H160) -> String;
 
-    fn reserves(&self) -> Vec<u128>;
+    fn get_decimals(&self, token: H160) -> u32;
 
-    fn set_currency(&mut self, currency: Currency);
+    fn get_reserve(&self, token: H160) -> u128;
+
+    fn get_format_reserve(&self, token: H160) -> String;
 
     /// 最后同步的日志
     fn last_synced_log(&self) -> (u64, u64);
 
-    /// 数据是否已填充
-    fn data_is_populated(&self) -> bool;
+    /// 检查池子是否正常
+    /// 1. 检查池子是否符合规范. token0 < token1
+    /// 2. 检查池子的货币信息是否已经填充
+    /// 3. 检查池子的深度数据是否已经填充
+    fn is_ok(&self) -> bool;
 
     /// Returns the vector of event signatures subscribed to when syncing the AMM.
     fn sync_on_event_signatures(&self) -> Vec<H256>;
@@ -82,21 +85,27 @@ macro_rules! amm {
                 }
             }
 
-            fn currencies(&self) -> Vec<Currency> {
+            fn get_symbol(&self, token: H160) -> String {
                 match self {
-                    $(AMM::$pool_type(pool) => pool.currencies(),)+
+                    $(AMM::$pool_type(pool) => pool.get_symbol(token),)+
                 }
             }
 
-            fn set_currency(&mut self, currency: Currency) {
+            fn get_decimals(&self, token: H160) -> u32 {
                 match self {
-                    $(AMM::$pool_type(pool) => pool.set_currency(currency),)+
+                    $(AMM::$pool_type(pool) => pool.get_decimals(token),)+
                 }
             }
 
-            fn reserves(&self) -> Vec<u128> {
+            fn get_reserve(&self, token: H160) -> u128 {
                 match self {
-                    $(AMM::$pool_type(pool) => pool.reserves(),)+
+                    $(AMM::$pool_type(pool) => pool.get_reserve(token),)+
+                }
+            }
+
+            fn get_format_reserve(&self, token: H160) -> String {
+                match self {
+                    $(AMM::$pool_type(pool) => pool.get_format_reserve(token),)+
                 }
             }
 
@@ -106,9 +115,9 @@ macro_rules! amm {
                 }
             }
 
-            fn data_is_populated(&self) -> bool {
+            fn is_ok(&self) -> bool {
                 match self {
-                    $(AMM::$pool_type(pool) => pool.data_is_populated(),)+
+                    $(AMM::$pool_type(pool) => pool.is_ok(),)+
                 }
             }
 
@@ -152,7 +161,6 @@ macro_rules! amm {
 }
 
 amm!(UniswapV2Pool);
-
 
 pub fn amm_sync_event_signatures(amms: &HashMap<Address, AMM>) -> Vec<H256> {
     let mut event_signatures: Vec<H256> = vec![];
