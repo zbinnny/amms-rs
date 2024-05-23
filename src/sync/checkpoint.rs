@@ -128,7 +128,7 @@ impl Checkpoint {
     }
 
     /// 删除包含无效货币的amm
-    fn remove_invalid_amm(&mut self) {
+    pub fn remove_invalid_amm(&mut self) {
         if self.currencies_blacklist.is_empty() {
             return;
         }
@@ -148,6 +148,7 @@ impl Checkpoint {
 
         // 删除无效交易对
         for address in amms_to_remove {
+            tracing::debug!(address = ?address, "remove invalid amm" );
             self.amms.remove(&address);
         }
     }
@@ -243,10 +244,10 @@ impl Checkpoint {
                     self.currencies_blacklist.insert(missing_currency);
                 }
             }
-
-            // 更新黑名单后, 删除无效的amm
-            self.remove_invalid_amm();
         }
+
+        // 更新黑名单后, 删除无效的amm
+        self.remove_invalid_amm();
 
         // 再次填充amm的currency信息
         for (_, amm) in self.amms.iter_mut() {
